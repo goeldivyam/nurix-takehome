@@ -61,3 +61,8 @@ _test_*
 !.claude/agents/*.md
 !.claude/skills/**/SKILL.md
 !.claude/agent-memory/**/*.md
+
+# Playwright MCP transcripts + local screenshots
+.playwright-mcp/
+ui_*.png
+/tmp/ui_*.png

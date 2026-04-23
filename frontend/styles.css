@@ -1,0 +1,917 @@
+/*
+ * Nurix Voice Campaigns — operator console styles.
+ *
+ * Design tokens and motion language are locked verbatim from the
+ * `audit-view-theme` SKILL.md: light-mode-only pure-neutral Geist-style
+ * gray ramp, exactly two shadow tokens, 4-point spacing grid, 4 / 6 / 8
+ * radius scale, `cubic-bezier(0.16, 1, 0.3, 1)` enters + `cubic-bezier(0.4,
+ * 0, 1, 1)` exits, 80 / 120 / 160 / 200ms duration caps. Every surface
+ * below is a direct application of that contract — no ad-hoc durations,
+ * no ad-hoc colors, no third shadow.
+ */
+
+:root {
+  /* Palette — light mode (audit-view-theme SKILL.md §Palette) */
+  --bg: #ffffff;
+  --bg-subtle: #fafafa;
+  --bg-hover: #f4f4f5;
+  --bg-active: #ededee;
+  --border: #e4e4e7;
+  --border-strong: #d4d4d8;
+  --fg: #0a0a0a;
+  --fg-muted: #52525b;
+  --fg-subtle: #8a8a93;
+  --accent: #2563eb;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --info: #7c3aed;
+
+  /* Elevation — exactly two tokens, nothing heavier */
+  --shadow-sm: 0 1px 2px rgba(17, 24, 28, 0.04);
+  --shadow-md: 0 4px 12px rgba(17, 24, 28, 0.06), 0 1px 2px rgba(17, 24, 28, 0.04);
+
+  /* Motion tokens — one curve family, 200ms cap */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --d-80: 80ms;
+  --d-120: 120ms;
+  --d-160: 160ms;
+  --d-200: 200ms;
+
+  /* Typography */
+  --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    system-ui, sans-serif;
+  --font-mono: "Geist Mono", "JetBrains Mono", "SF Mono", ui-monospace,
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  font-feature-settings: "cv11", "ss01", "tnum";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  color: var(--fg);
+  transition: background var(--d-80) var(--ease-out),
+    border-color var(--d-80) var(--ease-out);
+}
+
+button:hover {
+  background: var(--bg-hover);
+}
+
+button:active {
+  background: var(--bg-active);
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+button.primary:hover {
+  background: #1d4fd1;
+  border-color: #1d4fd1;
+}
+
+button.ghost {
+  border-color: transparent;
+  color: var(--fg-muted);
+}
+
+button.ghost:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input,
+select,
+textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  color: var(--fg);
+  transition: border-color var(--d-80) var(--ease-out),
+    box-shadow var(--d-80) var(--ease-out);
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--border-strong);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--fg-subtle);
+}
+
+textarea {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.4;
+  resize: vertical;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum";
+}
+
+/* ------ Page shell ------ */
+
+.page {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 0 24px 48px;
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24px 0 16px;
+}
+
+.page-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.section-heading {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 12px;
+}
+
+.micro-caps {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+/* ------ Tabs ------ */
+
+.tabnav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 24px;
+}
+
+.tab {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  background: transparent;
+  transition: color var(--d-80) var(--ease-out),
+    border-color var(--d-80) var(--ease-out);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--fg);
+  border-bottom-color: var(--accent);
+}
+
+.tab:hover {
+  color: var(--fg);
+}
+
+.tab-panel[hidden] {
+  display: none;
+}
+
+/* ------ Filter bar (sticky) ------ */
+
+.filter-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  padding: 0 12px;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.filter-bar input,
+.filter-bar select,
+.filter-bar button {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.filter-bar .spacer {
+  flex: 1;
+}
+
+.count-pill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  letter-spacing: 0.02em;
+}
+
+/* ------ Segmented control (time range) ------ */
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.seg button {
+  border: 0;
+  border-radius: 0;
+  padding: 0 10px;
+  height: 28px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  background: transparent;
+  transition: background var(--d-80) var(--ease-out),
+    color var(--d-80) var(--ease-out);
+}
+
+.seg button + button {
+  border-left: 1px solid var(--border);
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--bg-active);
+  color: var(--fg);
+}
+
+.seg button:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+/* ------ Popover ------ */
+
+.popover-host {
+  position: relative;
+}
+
+.popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 240px;
+  max-height: 340px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-md);
+  padding: 8px;
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition: opacity var(--d-120) var(--ease-out),
+    transform var(--d-120) var(--ease-out);
+}
+
+.popover[data-open="true"] {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.popover .popover-search {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.popover .popover-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.popover .popover-section:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.popover label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background var(--d-80) var(--ease-out);
+}
+
+.popover label:hover {
+  background: var(--bg-hover);
+}
+
+/* ------ Data table ------ */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg);
+  table-layout: fixed;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.table thead th {
+  position: sticky;
+  top: 48px;
+  z-index: 5;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  height: 36px;
+}
+
+.table tbody tr {
+  height: 36px;
+  transition: background var(--d-80) var(--ease-out);
+}
+
+.table tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+.table tbody td {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.table .cell-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum";
+}
+
+.table .cell-ts {
+  width: 128px;
+}
+
+.table .cell-campaign {
+  width: 180px;
+}
+
+.table .cell-call {
+  width: 140px;
+}
+
+.table .cell-event {
+  width: 200px;
+}
+
+.table .cell-reason {
+  width: auto;
+}
+
+.reason {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.reason[data-expanded="true"] {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.campaign-chip {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--bg-hover);
+  border-radius: 8px;
+  padding: 2px 8px;
+  color: var(--fg);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-pin-btn {
+  border: 0;
+  background: transparent;
+  color: var(--fg-subtle);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity var(--d-80) var(--ease-out),
+    color var(--d-80) var(--ease-out);
+}
+
+.table tbody tr:hover .row-pin-btn {
+  opacity: 1;
+}
+
+.row-pin-btn:hover {
+  color: var(--fg);
+  background: var(--bg-active);
+}
+
+/* ------ Event-type chips ------
+ * Mapping matches the audit-view-theme SKILL.md §Event-type categorization
+ * table verbatim. Each chip background is a 10% alpha tint of the semantic
+ * color, with the full solid accent as text color.
+ */
+
+.chip {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 4px;
+  padding: 2px 6px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+/* Declared FIRST so every specific .chip-* rule below wins on source order
+ * (the rendered HTML puts both `chip-EVENTTYPE` and `chip-default` on each
+ * element — same specificity, so source order decides).
+ */
+.chip-default {
+  background: var(--bg-hover);
+  color: var(--fg-muted);
+}
+
+.chip-DISPATCH,
+.chip-CLAIMED {
+  /* CLAIMED is a sibling of DISPATCH — same causal tick, same color family. */
+  background: rgba(37, 99, 235, 0.1);
+  color: var(--accent);
+}
+
+.chip-RETRY_DUE {
+  background: rgba(124, 58, 237, 0.1);
+  color: var(--info);
+}
+
+.chip-SKIP_CONCURRENCY,
+.chip-SKIP_BUSINESS_HOUR,
+.chip-SKIP_RETRY_BACKOFF,
+.chip-WEBHOOK_IGNORED_STALE,
+.chip-DEBUG_AGE_DIALING {
+  background: rgba(217, 119, 6, 0.1);
+  color: var(--warning);
+}
+
+.chip-WEBHOOK_RECEIVED {
+  background: var(--bg-hover);
+  color: var(--fg-muted);
+}
+
+/* Deliberate deviation from the semantic table: TRANSITION stays neutral so
+ * it never competes visually with the row's own --fg text and with the
+ * adjacent reason payload, which carries the real signal.
+ */
+.chip-TRANSITION {
+  background: var(--bg-hover);
+  color: var(--fg-muted);
+}
+
+.chip-RECLAIM_SKIPPED_TERMINAL,
+.chip-CAMPAIGN_COMPLETED,
+.chip-CAMPAIGN_PROMOTED_ACTIVE {
+  background: rgba(22, 163, 74, 0.1);
+  color: var(--success);
+}
+
+.chip-RECLAIM_EXECUTED {
+  background: rgba(220, 38, 38, 0.1);
+  color: var(--danger);
+}
+
+/* ------ Pinned row strip ------ */
+
+.pinned-strip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow-md);
+  padding: 8px;
+  margin-bottom: 16px;
+}
+
+.pinned-strip[hidden] {
+  display: none;
+}
+
+.pinned-row {
+  display: grid;
+  grid-template-columns: 128px 180px 140px 200px 1fr 32px;
+  gap: 12px;
+  align-items: center;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.pinned-row + .pinned-row {
+  border-top: 1px solid var(--border);
+}
+
+.pinned-row .dismiss {
+  border: 0;
+  background: transparent;
+  color: var(--fg-subtle);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.pinned-row .dismiss:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+/* ------ Status badges (campaigns list) ------ */
+
+.status-badge {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.status-PENDING {
+  background: var(--bg-hover);
+  color: var(--fg-muted);
+}
+
+.status-ACTIVE {
+  background: rgba(37, 99, 235, 0.1);
+  color: var(--accent);
+}
+
+.status-COMPLETED {
+  background: rgba(22, 163, 74, 0.1);
+  color: var(--success);
+}
+
+.status-FAILED {
+  background: rgba(220, 38, 38, 0.1);
+  color: var(--danger);
+}
+
+/* ------ States: empty / loading / error ------ */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 48px 16px;
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.empty-state .filter-summary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-subtle);
+}
+
+.loading-bar {
+  position: relative;
+  height: 2px;
+  background: transparent;
+  overflow: hidden;
+}
+
+.loading-bar[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: var(--accent);
+  animation: loading-slide 1200ms var(--ease-out) infinite;
+}
+
+@keyframes loading-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+.skeleton-row {
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.skeleton-cell {
+  height: 12px;
+  background: var(--bg-hover);
+  border-radius: 4px;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--bg-subtle);
+  border-left: 2px solid var(--danger);
+  border-top: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-radius: 4px;
+  margin: 12px 0;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.error-banner .factual {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.error-banner[hidden] {
+  display: none;
+}
+
+/* ------ Campaign create form ------ */
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px 24px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  margin-bottom: 24px;
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.form-field.wide {
+  grid-column: 1 / -1;
+}
+
+.form-field label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.form-field .hint {
+  font-size: 11px;
+  color: var(--fg-subtle);
+  font-family: var(--font-mono);
+}
+
+.form-field .err {
+  font-size: 11px;
+  color: var(--danger);
+  font-family: var(--font-mono);
+}
+
+.phones-textarea {
+  min-height: 140px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.form-footer {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.form-footer .status-line {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.form-footer .status-line.ok {
+  color: var(--success);
+}
+
+.schedule-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  background: var(--bg-subtle);
+}
+
+.schedule-day {
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.schedule-day .day-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+.schedule-windows {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.schedule-window {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.schedule-window input[type="time"] {
+  border: 0;
+  padding: 2px 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  width: 92px;
+}
+
+.schedule-window .dismiss {
+  border: 0;
+  background: transparent;
+  color: var(--fg-subtle);
+  padding: 0 4px;
+}
+
+.schedule-window .dismiss:hover {
+  color: var(--fg);
+}
+
+.schedule-window.invalid {
+  border-color: var(--danger);
+}
+
+/* ------ Campaign list (below form) ------ */
+
+.campaign-list {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+.campaign-row {
+  display: grid;
+  grid-template-columns: 2fr 120px 180px;
+  gap: 12px;
+  padding: 8px 12px;
+  align-items: center;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  transition: background var(--d-80) var(--ease-out);
+}
+
+.campaign-row:last-child {
+  border-bottom: 0;
+}
+
+.campaign-row:hover {
+  background: var(--bg-hover);
+}
+
+.campaign-row .name {
+  font-weight: 500;
+}
+
+.campaign-row .created {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+/* ------ Pagination ------ */
+
+.pagination {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 16px 0 0;
+}
+
+/* Visually-hidden utility for accessible labels */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}

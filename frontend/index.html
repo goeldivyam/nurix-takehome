@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nurix — Voice Campaigns</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap"
+    />
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <h1 class="page-title">Voice Campaigns</h1>
+        <span class="micro-caps">Nurix operator console</span>
+      </header>
+
+      <nav class="tabnav" role="tablist" aria-label="Primary">
+        <button
+          id="tab-campaigns"
+          class="tab"
+          role="tab"
+          aria-selected="true"
+          aria-controls="campaigns-tab"
+          data-tab="campaigns"
+        >
+          Campaigns
+        </button>
+        <button
+          id="tab-audit"
+          class="tab"
+          role="tab"
+          aria-selected="false"
+          aria-controls="audit-tab"
+          data-tab="audit"
+        >
+          Audit
+        </button>
+      </nav>
+
+      <section
+        id="campaigns-tab"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="tab-campaigns"
+      ></section>
+
+      <section
+        id="audit-tab"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="tab-audit"
+        hidden
+      ></section>
+    </main>
+
+    <script src="/ui/app.js"></script>
+    <script src="/ui/campaigns.js"></script>
+    <script src="/ui/audit.js"></script>
+  </body>
+</html>
