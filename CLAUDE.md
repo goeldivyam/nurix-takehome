@@ -138,6 +138,14 @@ pre-commit install
 
 **Rule**: NEVER pass `--no-verify` to `git commit`. If a hook fails, fix the underlying issue.
 
+## Git commit discipline
+
+- **One logical change per commit.** Unrelated edits go in separate commits.
+- **Subject ≤ 50 chars, imperative mood** (`Fix reclaim race`, not `Fixed the reclaim race`). Blank line, then a body that explains the WHY — a future reader shouldn't need the conversation history to understand the change.
+- **Cite sources** in the body where applicable: which agent finding, scenario, rubric point, or assignment line. Makes commit history a navigable design-decision log.
+- **Never bypass pre-commit** (`--no-verify`). Fix the hook failure.
+- **Never amend already-pushed commits.** Create a new commit instead.
+
 ## Parallel work — Git worktrees
 
 When working on multiple independent changes at the same time (different modules, different experiments, different agent-driven explorations), use `git worktree` — not multiple clones, not stash-and-switch.
@@ -183,6 +191,8 @@ git worktree remove ../nurix-takehome-<feature-name>
 | Final rubric score + interview defense | `interviewer-lens-reviewer` |
 
 Invoke agents in parallel when asks are independent. After any meaningful code chunk, run `senior-code-reviewer` before commit.
+
+**Every agent brief MUST begin with**: *"Before responding, re-read `context/assignment.pdf` and `CLAUDE.md`."* No exceptions — agents drift as the design evolves; re-reading keeps their feedback grounded in the current locked state, not their memory of an older version. Remind them to paste findings INLINE (not memory-only), and to severity-tag every finding (Critical / Important / Polish).
 
 ## Skills
 
