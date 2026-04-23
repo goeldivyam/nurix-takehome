@@ -206,6 +206,7 @@ Invoke agents in parallel when asks are independent. After any meaningful code c
 - `architecture-overview` — current file-level map; update as modules land.
 - `code-quality` — naming, dead code, async discipline.
 - `backend-conventions` — asyncpg, SKIP LOCKED, transactions, timezone rules.
+- `audit-view-theme` — design theme for the optional HTML view over `GET /audit` — palette, typography, layout, anti-patterns. Load only when building or reviewing the audit UI.
 
 ## Key reminders
 
