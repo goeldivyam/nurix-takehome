@@ -141,6 +141,13 @@ RETURNING *;
 - Windows that cross midnight (22:00–02:00) → split into two rows (22:00–23:59 + 00:00–02:00). No wrap logic.
 - **Validate `start < end` at write time.** Reject any campaign schedule row where `start >= end` (in the Pydantic request schema). Otherwise a silently-wrapping row makes the business-hour predicate return false all day and the campaign never dispatches.
 
+## Phone number normalization
+
+- All phone numbers are normalized to **E.164** format at the API boundary via a Pydantic validator on the campaign-create request. A phone that can't be parsed / normalized is rejected before it hits the database.
+- The partial unique index on `(phone) WHERE status IN ('QUEUED','DIALING','IN_PROGRESS')` relies on E.164 — `+14155551234` and `(415) 555-1234` would otherwise be treated as distinct numbers and the in-flight guard would silently miss a collision.
+- Use `phonenumbers` (google's library, pure-Python) for parse + format; pin the version in `requirements.txt`.
+- Never trust numbers round-tripping through other systems; re-normalize on any ingest path.
+
 ## Provider abstraction
 
 - All telephony interactions go through `app/provider/TelephonyProvider` (a `Protocol`).

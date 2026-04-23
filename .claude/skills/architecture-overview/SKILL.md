@@ -49,6 +49,7 @@ Fill in concrete columns as `schema.sql` is written.
 - `calls` — id, campaign_id, phone, status, attempt_epoch, retries_remaining, next_attempt_at, provider_call_id, created_at, updated_at + partial unique index on `(phone) WHERE status IN ('QUEUED','DIALING','IN_PROGRESS')`
 - `scheduler_campaign_state` — campaign_id (PK), last_dispatch_at — scheduler-owned, API reads only
 - `webhook_inbox` — id, provider_event_id UNIQUE, payload jsonb, received_at, processed_at NULL
+  - Append-only by the ingest route; rows are NOT deleted on processing. A daily cleanup job archives or deletes rows older than `WEBHOOK_INBOX_RETENTION_DAYS` (default 7) to bound growth. For the initial build the cleanup task is README-documented as future work; ops can run the delete manually until then.
 - `scheduler_audit` — id, ts, event_type, campaign_id, call_id, reason (text), state_before, state_after, extra (jsonb)
   - **Event types**: `DISPATCH`, `RETRY_DUE`, `SKIP_BUSINESS_HOUR`, `SKIP_CONCURRENCY`, `WEBHOOK_RECEIVED`, `WEBHOOK_IGNORED_STALE` (CAS no-op because state/epoch mismatched; row written in the same transaction as the inbox insert so operators see the "why it didn't move" without inferring from silence), `TRANSITION`, `RECLAIM_SKIPPED_TERMINAL` (provider `get_status` returned terminal — outcome applied on same `attempt_epoch`), `RECLAIM_EXECUTED` (`get_status` returned unknown — row reset to `QUEUED` with bumped epoch), `CAMPAIGN_COMPLETED`.
   - `DISPATCH` events carry a decision snapshot in `extra`: `{in_flight_before, max_concurrent, retries_pending_system, rr_cursor_before}`. Lifts "why this call, why now" from operator-inference to explicit fact.
@@ -70,7 +71,7 @@ Fill in concrete columns as `schema.sql` is written.
 - `GET /campaigns/{id}/stats` — total, completed, failed, retries_attempted (matches assignment spec)
 - `GET /calls/{id}` — single call status (maps internal states to `in_progress | completed | failed` per assignment)
 - `POST /webhooks/provider` — ack-then-process
-- `GET /audit` — filterable scheduler decisions (observability surface)
+- `GET /audit` — filterable scheduler decisions (observability surface). Cursor-based pagination using the composite `(ts, id)` — cursor-not-offset so late arrivals in the same `ts` bucket can't cause missed rows on the next page. Default page size 100, max 500. Filters: `campaign_id`, `event_type`, `from_ts`, `to_ts`, free-text `reason_contains`.
 
 ## Scheduler loop (one process, one event loop)
 
