@@ -140,9 +140,11 @@ pre-commit install
 
 ## Git commit discipline
 
+**Commits are written for the evaluator, not for our internal process.** The commit history is a design-decision log a reviewer can walk through to see how the system evolved. Never reference internal workflow artifacts (agent names, iteration numbers, review-process shorthand). Describe the DESIGN CHANGE and the reason, in design terms.
+
 - **One logical change per commit.** Unrelated edits go in separate commits.
-- **Subject ≤ 50 chars, imperative mood** (`Fix reclaim race`, not `Fixed the reclaim race`). Blank line, then a body that explains the WHY — a future reader shouldn't need the conversation history to understand the change.
-- **Cite sources** in the body where applicable: which agent finding, scenario, rubric point, or assignment line. Makes commit history a navigable design-decision log.
+- **Subject ≤ 50 chars, imperative mood** (`Harden reclaim against stale cache`, not `Fixed the reclaim stuff`). Blank line, then a body.
+- **The body explains the WHY** — a future reader shouldn't need conversation history. Cite the design reason: a concrete failure scenario, a rubric dimension, an assignment requirement, a production pattern (Twilio / Retell / Vapi style) — never who surfaced it internally.
 - **Never bypass pre-commit** (`--no-verify`). Fix the hook failure.
 - **Never amend already-pushed commits.** Create a new commit instead.
 
