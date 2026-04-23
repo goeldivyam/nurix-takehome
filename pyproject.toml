@@ -28,6 +28,8 @@ select = [
     "UP",     # pyupgrade
     "B",      # flake8-bugbear
     "ASYNC",  # flake8-async (critical for this project)
+    "DTZ",    # flake8-datetimez — bans naive datetime.now(); guards per-campaign business-hour correctness
+    "SIM",    # flake8-simplify — low-noise readability cleanups
     "RUF",    # Ruff-specific rules
 ]
 ignore = []

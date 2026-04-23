@@ -1,0 +1,4 @@
+- [User role](user_role.md) — Divyam: Nurix.ai Principal Engineer take-home candidate, values terse principal-level reviews
+- [Audit transaction invariant](project_audit_transaction.md) — audit rows share caller's txn; audit_pool is read-only
+- [Top-3 PR rejection patterns](feedback_top3_rejects.md) — state mutation outside state/, provider boundary leaks, second-acquire
+- [Ruff config gaps](project_ruff_gaps.md) — DTZ and SIM are the high-value missing rule families

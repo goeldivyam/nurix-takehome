@@ -37,10 +37,15 @@ Judged against Mohit's 8 points:
 |---|---|
 | `app/api` | FastAPI routes — campaign CRUD, status, stats, webhook |
 | `app/persistence` | asyncpg pools + repositories — data access |
-| `app/scheduler` | WRR rotation + retry priority + concurrency / schedule gates |
+| `app/scheduler` | Round-robin rotation + retry priority + concurrency / schedule gates |
 | `app/provider` | `TelephonyProvider` Protocol + mock implementation |
 | `app/state` | Campaign + call state machines; sole mutator |
 | `app/audit` | Event writer + reader — observability surface |
+
+**Shared types — owned by a specific layer** to prevent duplication across modules:
+
+- `CallStatus` enum — owned by `app/state/`, imported by provider / audit / api. Closed set: `{DIALING, IN_PROGRESS, COMPLETED, FAILED, NO_ANSWER, BUSY}`. Adapter-side translation (e.g. Twilio's `canceled` → `FAILED`) is the provider port's contract, not the core's.
+- `AuditEvent` dataclass — owned by `app/audit/`, imported by state / scheduler.
 
 ## Scheduler policy (locked)
 
@@ -66,19 +71,32 @@ The assignment's existing service exposes two APIs: trigger a call, check call s
 
 The rest of the system talks only to the port — never to the mock directly.
 
+Future extension points (README future-work, not built): `cancel(call_id)` for campaign abort; `parse_event(payload) → ProviderEvent` when a second adapter (Twilio / Vapi) lands. Adding these when they're needed beats guessing their shape today — Twilio / Vapi / Retell all diverge on cancel semantics.
+
+**Conversation engine (TTS / STT / LLM) is out of scope for this service.** It sits behind a separate port (`ConversationEngine`) invoked by the telephony provider on media events, not by our scheduler. The campaign layer passes `script_ref` down through `place_call`; the engine resolves the audio loop independently. This service's job ends at the telephony boundary.
+
 ## State model
 
 - **Campaign**: `PENDING → ACTIVE → COMPLETED | FAILED`
 - **Call**: `QUEUED → DIALING → IN_PROGRESS → COMPLETED | FAILED`; failed-with-retries-left → `RETRY_PENDING → QUEUED` (requeued when `next_attempt_at` reached).
 - Every transition: atomic `UPDATE WHERE id=$id AND status=$expected AND attempt_epoch=$expected`.
 
+**Retry classification** — which failures are retryable:
+
+- **Terminal provider errors** (invalid number, blocked, rejected) → `FAILED` directly. No retry.
+- **Transient provider errors**, **`NO_ANSWER`**, **`BUSY`** → `RETRY_PENDING` with `next_attempt_at = NOW() + backoff`.
+- **Backoff** = `base * 2^attempt` seconds with ±20% jitter; `base` and `max_attempts` from campaign `retry_config`.
+- When `retries_remaining` hits 0 → `FAILED`.
+
 ## Crash safety
 
 - `call.attempt_epoch` (int) increments on every retry and every reclaim.
-- **Stuck reclaim**: `DIALING` > `max_call_duration + 30s` → reset to `QUEUED` with bumped epoch.
+- **Stuck reclaim**: `DIALING` > `max_call_duration + 30s` → reset to `QUEUED` with bumped epoch. **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
 - **Idempotency key** at provider port = `f"{call_id}:{attempt_epoch}"`.
 - **Phone-level in-flight guard**: unique partial index on `(phone) WHERE status IN ('QUEUED','DIALING','IN_PROGRESS')`.
 - **Webhook**: ack-then-process via `webhook_inbox` with `provider_event_id UNIQUE`.
+- **Webhook ordering is NOT guaranteed** by providers (Twilio's `statusCallback` explicitly doesn't). Stale or out-of-order events are silently dropped by the state machine's CAS on `(status, attempt_epoch)`.
+- **Audit atomicity**: every state transition and its audit row are written on the same connection inside the same transaction. Readers never observe a transition without its reason. `audit_pool` exists strictly for observability reads — never for writes on the critical path.
 
 ## Development workflow
 

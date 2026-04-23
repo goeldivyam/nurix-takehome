@@ -117,7 +117,8 @@ RETURNING *;
 ## Transactions
 
 - Explicit `async with conn.transaction():` for multi-statement writes.
-- **State transition + audit row must be in the same transaction.** If the audit fails, the transition rolls back.
+- **State transition + audit row must be in the same transaction on the same connection.** If the audit fails, the transition rolls back.
+- **Audit writes use the caller's connection — NEVER `audit_pool`.** Reject any `audit_pool.execute(...)` / `audit_pool.fetchval(...)` inside a write path, and any `asyncio.create_task(emit_audit(...))` after a transition. `audit_pool` is strictly for observability reads (`GET /audit`). Mixing pools here either loses audit rows on crash (breaks rubric #7 — the audit log IS the visualization) or double-acquires a pool and deadlocks.
 - **Webhook ack MUST NOT be in a transaction with downstream processing.** The `/webhooks/provider` endpoint does one `INSERT INTO webhook_inbox` and returns `200`; processing is a separate background task reading the inbox.
 
 ## Timezone handling

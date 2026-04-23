@@ -50,6 +50,13 @@ Fill in concrete columns as `schema.sql` is written.
 - `scheduler_campaign_state` — campaign_id (PK), last_dispatch_at — scheduler-owned, API reads only
 - `webhook_inbox` — id, provider_event_id UNIQUE, payload jsonb, received_at, processed_at NULL
 - `scheduler_audit` — id, ts, event_type, campaign_id, call_id, reason (text), state_before, state_after, extra (jsonb)
+  - `DISPATCH` events carry a decision snapshot in `extra`: `{in_flight_before, max_concurrent, retries_pending_system, rr_cursor_before}`. Lifts "why this call, why now" from operator-inference to explicit fact, with no new event type.
+  - Every audit row is written on the caller's connection inside the same transaction as its triggering state transition. See `backend-conventions` skill for the invariant.
+
+## Shared type ownership
+
+- **`CallStatus` enum** (closed: `{DIALING, IN_PROGRESS, COMPLETED, FAILED, NO_ANSWER, BUSY}`) lives in `app/state/`. Provider / audit / api import it. Provider adapters translate vendor-native status vocabulary into this closed set.
+- **`AuditEvent` dataclass** lives in `app/audit/`. State / scheduler import it.
 
 ## Public API surface (target)
 
