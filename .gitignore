@@ -52,3 +52,12 @@ tmp/
 # Scratch / temp files (per CLAUDE.md convention — prefix with _tmp or _test)
 _tmp_*
 _test_*
+
+# Markdown files — block all ad-hoc notes; keep only deliverables + Claude config
+*.md
+!README.md
+!CLAUDE.md
+!docs/*.md
+!.claude/agents/*.md
+!.claude/skills/**/SKILL.md
+!.claude/agent-memory/**/*.md
