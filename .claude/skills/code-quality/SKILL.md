@@ -88,6 +88,7 @@ The idempotency key is always `f"{call_id}:{attempt_epoch}"`. Never plain `call_
 - CPU work or sync library needed? Wrap with `await asyncio.to_thread(...)`.
 - **Do not share one asyncpg connection across coroutines.** `asyncio.gather` tasks each need their own `pool.acquire()`.
 - Don't fire-and-forget `asyncio.create_task(...)` without capturing the task and handling its exception — orphaned tasks silently swallow errors.
+- **Prefer `async with asyncio.TaskGroup():` over `asyncio.gather(...)`** for structured concurrency (Python 3.11+). TaskGroup cancels siblings on any failure and propagates exceptions cleanly. Reserve tracked `asyncio.create_task(...)` for fire-and-forget daemons (scheduler tick loop, webhook processor, stuck-reclaim sweep — see `backend-conventions` for the tracked-set pattern).
 
 ## No dead code, no half-built
 
@@ -115,6 +116,7 @@ The idempotency key is always `f"{call_id}:{attempt_epoch}"`. Never plain `call_
 - Business-hour check: convert UTC "now" to the campaign's timezone **once**, compare against that campaign's schedule.
 - Never store naive timestamps. Never compare across timezones without explicit conversion.
 - `zoneinfo` (stdlib) is the canonical timezone source; avoid `pytz`.
+- **Wall clock vs monotonic**: use `datetime.now(UTC)` for stored / scheduled times (business-hour windows, `next_attempt_at`, audit timestamps). Use `time.monotonic()` for **duration measurements** — tick-loop sleeps, reclaim-window checks, backoff delays. NTP skew would otherwise corrupt the `max_call_duration + 30s` reclaim window and retry backoffs.
 
 ## Logging
 

@@ -61,6 +61,8 @@ Each tick is a pipeline of filters:
 
 Weights are intentionally omitted — the assignment specifies per-campaign `max_concurrent`, per-campaign retry config, and per-campaign business hours, but says nothing about one campaign having priority over another. "Fairness" in the spec means retries-before-new *inside* the queue, not weighted share between campaigns. Adding a weight field later is a one-line extension; document as future work in README.
 
+**Scheduler wake signal** — named port `SchedulerWake` owned by `app/scheduler/`, exposing `notify()` and `async wait(timeout)`. State machine calls `notify()` after every terminal transition; webhook processor calls `notify()` after each inbox dequeue + transition. The scheduler loop `await`s `wait()` between ticks with a periodic timer as safety net. Implementation = a module-level `asyncio.Event`. Prevents state / webhook from importing scheduler internals or scheduler from polling. Dependency-injected into state + webhook code; in-memory fake for tests.
+
 ## Provider abstraction
 
 The assignment's existing service exposes two APIs: trigger a call, check call status. Our `app/provider/` layer wraps both:
@@ -71,7 +73,11 @@ The assignment's existing service exposes two APIs: trigger a call, check call s
 
 The rest of the system talks only to the port — never to the mock directly.
 
-Future extension points (README future-work, not built): `cancel(call_id)` for campaign abort; `parse_event(payload) → ProviderEvent` when a second adapter (Twilio / Vapi) lands. Adding these when they're needed beats guessing their shape today — Twilio / Vapi / Retell all diverge on cancel semantics.
+**`CallHandle` shape** (returned by `place_call`): `{ provider_call_id: str, accepted_at: datetime }`. **Provider errors** are typed exceptions owned by `app/provider/`: `ProviderRejected(reason_code)` for expected rejections (invalid number, blocked), `ProviderUnavailable` for infrastructure failures. Scheduler and state catch these exception types — never provider-specific errors.
+
+**Webhook payload → `ProviderEvent` translation** is the adapter's responsibility (mock: a module-level `parse_event(payload) → ProviderEvent` in `app/provider/mock.py`). The webhook processor dequeues from `webhook_inbox`, calls the adapter's parse helper, then `state.transition(...)`. Translation stays in the adapter, never in the API layer. Moving `parse_event` onto the `TelephonyProvider` Protocol becomes useful only when a second adapter lands.
+
+Future extension points (README future-work, not built): `cancel(call_id)` for campaign abort; `parse_event(payload) → ProviderEvent` on the Protocol when a second adapter (Twilio / Vapi) lands. Adding these when they're needed beats guessing their shape today — Twilio / Vapi / Retell all diverge on cancel semantics.
 
 **Conversation engine (TTS / STT / LLM) is out of scope for this service.** It sits behind a separate port (`ConversationEngine`) invoked by the telephony provider on media events, not by our scheduler. The campaign layer passes `script_ref` down through `place_call`; the engine resolves the audio loop independently. This service's job ends at the telephony boundary.
 
@@ -91,7 +97,7 @@ Future extension points (README future-work, not built): `cancel(call_id)` for c
 ## Crash safety
 
 - `call.attempt_epoch` (int) increments on every retry and every reclaim.
-- **Stuck reclaim**: when `DIALING` exceeds `max_call_duration + 30s`, FIRST call `provider.get_status(call_id)` to confirm. If the provider reports a terminal state (COMPLETED / FAILED / NO_ANSWER / BUSY), apply that outcome directly — do NOT reclaim. Only reclaim (reset to `QUEUED`, bump `attempt_epoch`) when the provider returns unknown / still-dialing. **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
+- **Stuck reclaim** runs on a background sweep, NEVER on the dispatch critical path. When `DIALING` exceeds `max_call_duration + 30s`, FIRST call `provider.get_status(call_id)` as an **authoritative fetch** (the adapter must bypass any internal status cache; widen the grace window beyond any known provider cache TTL). The call carries a **configurable timeout** — on timeout or error, treat the result as unknown and proceed to reclaim. If the provider reports a terminal state (COMPLETED / FAILED / NO_ANSWER / BUSY), apply that outcome **on the SAME `attempt_epoch`** (no bump) — do NOT reclaim. Only reclaim (reset to `QUEUED`, bump `attempt_epoch`) when the provider returns unknown / still-dialing. The sweep fans out across stuck rows in parallel via `asyncio.TaskGroup`; a single slow `get_status` never head-of-line-blocks the sweep. **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
 - **Idempotency key** at provider port = `f"{call_id}:{attempt_epoch}"`.
 - **Phone-level in-flight guard**: unique partial index on `(phone) WHERE status IN ('QUEUED','DIALING','IN_PROGRESS')`.
 - **Webhook**: ack-then-process via `webhook_inbox` with `provider_event_id UNIQUE`.

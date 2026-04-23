@@ -50,13 +50,17 @@ Fill in concrete columns as `schema.sql` is written.
 - `scheduler_campaign_state` — campaign_id (PK), last_dispatch_at — scheduler-owned, API reads only
 - `webhook_inbox` — id, provider_event_id UNIQUE, payload jsonb, received_at, processed_at NULL
 - `scheduler_audit` — id, ts, event_type, campaign_id, call_id, reason (text), state_before, state_after, extra (jsonb)
-  - `DISPATCH` events carry a decision snapshot in `extra`: `{in_flight_before, max_concurrent, retries_pending_system, rr_cursor_before}`. Lifts "why this call, why now" from operator-inference to explicit fact, with no new event type.
+  - **Event types**: `DISPATCH`, `RETRY_DUE`, `SKIP_BUSINESS_HOUR`, `SKIP_CONCURRENCY`, `WEBHOOK_RECEIVED`, `WEBHOOK_IGNORED_STALE` (CAS no-op because state/epoch mismatched; row written in the same transaction as the inbox insert so operators see the "why it didn't move" without inferring from silence), `TRANSITION`, `RECLAIM_SKIPPED_TERMINAL` (provider `get_status` returned terminal — outcome applied on same `attempt_epoch`), `RECLAIM_EXECUTED` (`get_status` returned unknown — row reset to `QUEUED` with bumped epoch), `CAMPAIGN_COMPLETED`.
+  - `DISPATCH` events carry a decision snapshot in `extra`: `{in_flight_before, max_concurrent, retries_pending_system, rr_cursor_before}`. Lifts "why this call, why now" from operator-inference to explicit fact.
   - Every audit row is written on the caller's connection inside the same transaction as its triggering state transition. See `backend-conventions` skill for the invariant.
 
 ## Shared type ownership
 
 - **`CallStatus` enum** (closed: `{DIALING, IN_PROGRESS, COMPLETED, FAILED, NO_ANSWER, BUSY}`) lives in `app/state/`. Provider / audit / api import it. Provider adapters translate vendor-native status vocabulary into this closed set. `app/provider/` importing from `app/state/` is a **type-only import** of a closed enum — not a behavior dependency; provider never calls into state.
 - **`AuditEvent` dataclass** lives in `app/audit/` as a pure frozen dataclass (no `.save()` / `.emit()` — no I/O methods). Writes go through `emit_audit(conn, event)`; see `code-quality` and `backend-conventions` skills.
+- **`SchedulerWake` port** lives in `app/scheduler/`. Methods: `notify() -> None` and `async wait(timeout: float | None) -> bool`. Implementation = `asyncio.Event`. Dependency-injected into state + webhook processor (which call `notify()` on every terminal transition / inbox dequeue). Scheduler loop awaits `wait()` between ticks.
+- **`CallHandle` dataclass** lives in `app/provider/` — `{ provider_call_id: str, accepted_at: datetime }`. Provider exceptions (`ProviderRejected(reason_code)`, `ProviderUnavailable`) also owned here — scheduler / state catch these types, never vendor-specific errors.
+- **`parse_event(payload) -> ProviderEvent`** is an adapter-module-level function (mock: `app/provider/mock.py::parse_event`). Invoked by the webhook processor after `webhook_inbox` dequeue. NOT on the `TelephonyProvider` Protocol — promoting it there is deferred until a second adapter lands.
 
 ## Public API surface (target)
 

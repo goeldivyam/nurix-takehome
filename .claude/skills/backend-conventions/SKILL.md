@@ -65,7 +65,9 @@ async with pool.acquire() as conn:
 
 ## Claim pattern — SKIP LOCKED
 
-The scheduler claims the next call to dial in one atomic statement:
+**Two-level selection.** The scheduler tick loop chooses (a) WHICH call to claim next via the cross-campaign policy in CLAUDE.md (system-level retry sweep across all campaigns → then round-robin across eligible campaigns), then (b) issues the **per-campaign claim primitive** below against the selected campaign. Retry priority lives in the scheduler — the primitive itself is FIFO within the campaign.
+
+The per-campaign claim primitive — one atomic statement:
 
 ```sql
 WITH candidate AS (
@@ -74,7 +76,7 @@ WITH candidate AS (
     WHERE campaign_id = $1
       AND status = 'QUEUED'
       AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-    ORDER BY retries_remaining DESC, created_at ASC  -- retries first, then FIFO
+    ORDER BY created_at ASC  -- FIFO within the campaign
     LIMIT 1
     FOR UPDATE SKIP LOCKED
 )
@@ -90,6 +92,7 @@ RETURNING calls.*;
 - `SKIP LOCKED` lets multiple schedulers claim different rows without serializing.
 - `FOR UPDATE` holds the row lock until UPDATE commits.
 - Claim + transition are atomic — no window where a row is claimed but not yet transitioned.
+- DO NOT add `ORDER BY retries_remaining DESC` here — that would encode per-campaign retry priority and contradict the system-level rule (retries-before-new applies across all campaigns, not within one). Retry priority is decided at the scheduler layer via the retry sweep step.
 
 ## State transitions — compare-and-swap
 
