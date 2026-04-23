@@ -91,11 +91,11 @@ Future extension points (README future-work, not built): `cancel(call_id)` for c
 ## Crash safety
 
 - `call.attempt_epoch` (int) increments on every retry and every reclaim.
-- **Stuck reclaim**: `DIALING` > `max_call_duration + 30s` → reset to `QUEUED` with bumped epoch. **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
+- **Stuck reclaim**: when `DIALING` exceeds `max_call_duration + 30s`, FIRST call `provider.get_status(call_id)` to confirm. If the provider reports a terminal state (COMPLETED / FAILED / NO_ANSWER / BUSY), apply that outcome directly — do NOT reclaim. Only reclaim (reset to `QUEUED`, bump `attempt_epoch`) when the provider returns unknown / still-dialing. **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
 - **Idempotency key** at provider port = `f"{call_id}:{attempt_epoch}"`.
 - **Phone-level in-flight guard**: unique partial index on `(phone) WHERE status IN ('QUEUED','DIALING','IN_PROGRESS')`.
 - **Webhook**: ack-then-process via `webhook_inbox` with `provider_event_id UNIQUE`.
-- **Webhook ordering is NOT guaranteed** by providers (Twilio's `statusCallback` explicitly doesn't). Stale or out-of-order events are silently dropped by the state machine's CAS on `(status, attempt_epoch)`.
+- **Webhook ordering is NOT guaranteed** by providers (Twilio's `statusCallback` explicitly doesn't). The state machine's CAS on `(status, attempt_epoch)` silently no-ops for stale or out-of-order events — but `webhook_inbox` PERSISTS every accepted event. Stale events remain queryable for forensics (the classic "lost webhook" debugging story).
 - **Audit atomicity**: every state transition and its audit row are written on the same connection inside the same transaction. Readers never observe a transition without its reason. `audit_pool` exists strictly for observability reads — never for writes on the critical path.
 
 ## Development workflow

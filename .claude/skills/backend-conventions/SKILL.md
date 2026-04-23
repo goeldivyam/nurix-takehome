@@ -148,3 +148,20 @@ RETURNING *;
 
 - `app/config.py` reads env vars at startup; exposes a frozen `Settings` dataclass.
 - Defaults live here, not scattered across modules: `MAX_CONCURRENT_DEFAULT`, `STUCK_RECLAIM_SECONDS`, `MAX_RETRIES_DEFAULT`, `RETRY_BACKOFF_BASE_SECONDS`, `SCHEDULER_IDLE_INTERVAL_MS`.
+
+## FastAPI lifespan owns pools
+
+- All three asyncpg pools (`api_pool`, `scheduler_pool`, `webhook_pool`) are created inside the FastAPI `lifespan` async context manager and closed on shutdown. NEVER at module import.
+- Tests that need pools spin them up in a fixture with the same lifespan semantics — no global singleton pool.
+- The scheduler tick loop and webhook processor are started inside `lifespan` AFTER pools are ready and cancelled cleanly BEFORE pools close.
+
+## Background tasks have lifecycle
+
+- Every `asyncio.create_task(...)` for scheduler tick, webhook processor, or stuck-reclaim sweep is stored in a module-level `set[asyncio.Task]` and attaches a done-callback that logs unhandled exceptions and removes the task from the set.
+- On shutdown: cancel all tasks, `await asyncio.gather(*tasks, return_exceptions=True)`. Orphaned tasks that silently swallow exceptions are a Critical reject.
+
+## Pydantic vs dataclass boundary
+
+- Pydantic models live in `app/api/schemas.py` ONLY — for HTTP request parsing and response serialization.
+- Internal value objects (`AuditEvent`, `CallHandle`, scheduler decisions) are frozen `@dataclass(frozen=True, slots=True)`. Crossing the boundary happens explicitly in `app/api/`.
+- Codified further in the `code-quality` skill.

@@ -59,6 +59,29 @@ The idempotency key is always `f"{call_id}:{attempt_epoch}"`. Never plain `call_
 - **No bare `except:` or `except Exception:`** without re-raise. Catch specific types, log, rethrow if not handled.
 - **Avoid broad decorators.** If `@retry` wraps business logic, the retry policy belongs in the business layer, not a decorator.
 
+## Enums that map to DB values
+
+- The value of every enum member used for persistence MUST equal its DB string literal. No translation layer. Example: `CallStatus.QUEUED.value == "QUEUED"`.
+- SQL references the enum via `.value`, never a bare string literal:
+  ```python
+  # GOOD
+  await conn.execute("UPDATE calls SET status = $1 WHERE id = $2", CallStatus.DIALING.value, call_id)
+  # BAD — drifts silently if the enum is renamed
+  await conn.execute("UPDATE calls SET status = 'DIALING' WHERE id = $1", call_id)
+  ```
+- `CallStatus` (closed set: `DIALING, IN_PROGRESS, COMPLETED, FAILED, NO_ANSWER, BUSY`) lives in `app/state/`. Provider adapters translate their native vocabulary into this set; never the other way around.
+
+## Audit emission signature
+
+- Audit writes go through one function: `emit_audit(conn: Connection, event: AuditEvent) -> None`. `conn` is the first positional argument. **Never defaulted. Never fetched from a pool inside `emit_audit`.** Callers pass their own transaction's connection so the audit row commits atomically with the transition.
+- `AuditEvent` is a pure frozen dataclass. No `.save()`, `.emit()`, or any method that performs I/O.
+
+## Pydantic vs dataclass boundary
+
+- **Pydantic** models live in `app/api/schemas.py` ONLY, at the HTTP boundary (request parse + response serialize).
+- **Frozen `@dataclass(frozen=True, slots=True)`** for every internal value object: `AuditEvent`, `CallHandle`, scheduler decisions, state-transition records.
+- Internal code never imports pydantic. Crossing the boundary happens explicitly in `app/api/` (`Schema.model_validate(...)` → internal dataclass, and the reverse on response).
+
 ## Async discipline
 
 - `async def` means **no blocking calls inside**. No `time.sleep`, no `requests.get`, no sync DB drivers.

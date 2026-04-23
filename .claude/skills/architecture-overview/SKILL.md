@@ -55,8 +55,8 @@ Fill in concrete columns as `schema.sql` is written.
 
 ## Shared type ownership
 
-- **`CallStatus` enum** (closed: `{DIALING, IN_PROGRESS, COMPLETED, FAILED, NO_ANSWER, BUSY}`) lives in `app/state/`. Provider / audit / api import it. Provider adapters translate vendor-native status vocabulary into this closed set.
-- **`AuditEvent` dataclass** lives in `app/audit/`. State / scheduler import it.
+- **`CallStatus` enum** (closed: `{DIALING, IN_PROGRESS, COMPLETED, FAILED, NO_ANSWER, BUSY}`) lives in `app/state/`. Provider / audit / api import it. Provider adapters translate vendor-native status vocabulary into this closed set. `app/provider/` importing from `app/state/` is a **type-only import** of a closed enum — not a behavior dependency; provider never calls into state.
+- **`AuditEvent` dataclass** lives in `app/audit/` as a pure frozen dataclass (no `.save()` / `.emit()` — no I/O methods). Writes go through `emit_audit(conn, event)`; see `code-quality` and `backend-conventions` skills.
 
 ## Public API surface (target)
 

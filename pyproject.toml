@@ -30,6 +30,8 @@ select = [
     "ASYNC",  # flake8-async (critical for this project)
     "DTZ",    # flake8-datetimez — bans naive datetime.now(); guards per-campaign business-hour correctness
     "SIM",    # flake8-simplify — low-noise readability cleanups
+    "PT",     # flake8-pytest-style — consistent test fixtures / parametrize
+    "PLR2004", # pylint — bans magic number literals (use named constants)
     "RUF",    # Ruff-specific rules
 ]
 ignore = []
