@@ -39,6 +39,7 @@ ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["N802", "S101", "S106", "PLR2004"]  # allow non-snake-case test methods, `assert`, test passwords, magic numbers in parametrize
+"app/provider/types.py" = ["N818"]  # ProviderRejected / ProviderUnavailable names are design-locked in CLAUDE.md
 
 [tool.ruff.format]
 quote-style = "double"
