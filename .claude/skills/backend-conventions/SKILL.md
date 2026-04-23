@@ -29,11 +29,11 @@ Separate pools by role:
 
 | Pool | Role | Size |
 |---|---|---|
-| `api_pool` | API read path | 5–10 |
+| `api_pool` | API read path (`GET /campaigns`, `GET /campaigns/{id}/stats`, `GET /calls/{id}`, `GET /audit`) | 5–10 |
 | `scheduler_pool` | Scheduler + state writes | 5–10 |
 | `webhook_pool` | Webhook ack (fast insert + return) | 1–3 |
 
-Rationale: a webhook burst must not starve the API or the scheduler.
+Rationale: a webhook burst must not starve the API or the scheduler. The `/audit` read endpoint MUST use `api_pool` — NOT `scheduler_pool` — otherwise an operator running forensic queries steals capacity from the tick loop.
 
 ## Pool acquire discipline
 
@@ -139,6 +139,7 @@ RETURNING *;
   return False
   ```
 - Windows that cross midnight (22:00–02:00) → split into two rows (22:00–23:59 + 00:00–02:00). No wrap logic.
+- **Validate `start < end` at write time.** Reject any campaign schedule row where `start >= end` (in the Pydantic request schema). Otherwise a silently-wrapping row makes the business-hour predicate return false all day and the campaign never dispatches.
 
 ## Provider abstraction
 
@@ -150,7 +151,7 @@ RETURNING *;
 ## Configuration
 
 - `app/config.py` reads env vars at startup; exposes a frozen `Settings` dataclass.
-- Defaults live here, not scattered across modules: `MAX_CONCURRENT_DEFAULT`, `STUCK_RECLAIM_SECONDS`, `MAX_RETRIES_DEFAULT`, `RETRY_BACKOFF_BASE_SECONDS`, `SCHEDULER_IDLE_INTERVAL_MS`.
+- Defaults live here, not scattered across modules: `MAX_CONCURRENT_DEFAULT`, `STUCK_RECLAIM_SECONDS`, `STUCK_RECLAIM_GET_STATUS_TIMEOUT_SECONDS`, `MAX_RETRIES_DEFAULT`, `RETRY_BACKOFF_BASE_SECONDS`, `SCHEDULER_IDLE_INTERVAL_MS`, `SCHEDULER_SAFETY_NET_SECONDS`.
 
 ## FastAPI lifespan owns pools
 

@@ -89,6 +89,7 @@ The idempotency key is always `f"{call_id}:{attempt_epoch}"`. Never plain `call_
 - **Do not share one asyncpg connection across coroutines.** `asyncio.gather` tasks each need their own `pool.acquire()`.
 - Don't fire-and-forget `asyncio.create_task(...)` without capturing the task and handling its exception — orphaned tasks silently swallow errors.
 - **Prefer `async with asyncio.TaskGroup():` over `asyncio.gather(...)`** for structured concurrency (Python 3.11+). TaskGroup cancels siblings on any failure and propagates exceptions cleanly. Reserve tracked `asyncio.create_task(...)` for fire-and-forget daemons (scheduler tick loop, webhook processor, stuck-reclaim sweep — see `backend-conventions` for the tracked-set pattern).
+- **The scheduler tick loop itself is a tracked `create_task` daemon — NOT inside a TaskGroup.** TaskGroup's sibling-cancel-on-failure would tear down the whole loop on one bad tick. Only the per-tick fan-outs (e.g. the stuck-reclaim sweep across multiple rows) use TaskGroup, and each child task catches its own exceptions and returns a typed Result so one failure doesn't cancel its siblings either.
 
 ## No dead code, no half-built
 
