@@ -52,9 +52,9 @@ Judged against Mohit's 8 points:
 Each tick is a pipeline of filters:
 
 1. **Eligibility**: campaign is ACTIVE, in business hours right now, has work to do.
-2. **Retry sweep**: any campaign has a `RETRY_PENDING` call whose `next_attempt_at` has passed → dispatch that first.
-3. **Concurrency gate**: skip any eligible campaign already at its `max_concurrent`.
-4. **Round-robin pick**: among survivors, pick in stable order (by `campaign_id`, cycling). No weights — the assignment does not specify priority between campaigns.
+2. **Concurrency gate** applied to every candidate (retry or new): skip any campaign already at its `max_concurrent`. Gate is evaluated ONCE per tick and applies to both the retry sweep and the round-robin pick — a retry-due call on a capped campaign waits exactly like a new call would.
+3. **Retry sweep**: among campaigns that cleared the concurrency gate, if any has a `RETRY_PENDING` call whose `next_attempt_at` has passed → dispatch that first (system-level, across all eligible campaigns).
+4. **Round-robin pick**: among survivors with no retry due, pick in stable order (by `campaign_id`). The RR cursor advances one campaign per dispatch and is persisted via `scheduler_campaign_state.last_dispatch_at` — on restart, the cursor resumes from the campaign with the oldest `last_dispatch_at`, so we don't always re-start from the alphabetically-first campaign. No weights — the assignment does not specify priority between campaigns.
 5. **Dispatch**: write audit row with full reasoning (why this call, why now).
 
 **Business hours** = per-campaign timezone + weekly calendar. Each day has zero or more `[start, end]` windows (e.g. Mon–Fri 14:00–16:00 + 20:00–22:00; Sat 11:00–13:00; Sun 18:00–20:00). Each day independent. Single predicate: "is current local time inside any of today's windows?"
@@ -107,7 +107,11 @@ Future extension points (README future-work, not built): `cancel(call_id)` for c
 ## Crash safety
 
 - `call.attempt_epoch` (int) increments on every retry and every reclaim.
-- **Stuck reclaim** runs on a background sweep, NEVER on the dispatch critical path. When `DIALING` exceeds `max_call_duration + 30s`, FIRST call `provider.get_status(call_id)` as a **best-effort confirm** (configurable timeout `STUCK_RECLAIM_GET_STATUS_TIMEOUT_SECONDS`). Correctness does NOT depend on bypassing provider-side caches — it depends on the grace window being wider than any plausible provider cache TTL plus the epoch CAS at apply time. On timeout or error, treat the result as unknown and proceed to reclaim. If the provider reports a terminal state (COMPLETED / FAILED / NO_ANSWER / BUSY), apply that outcome **on the SAME `attempt_epoch`** (no bump) — do NOT reclaim. Only reclaim (reset to `QUEUED`, bump `attempt_epoch`) when the provider returns unknown / still-dialing. The sweep fans out across stuck rows via `asyncio.TaskGroup`, but **each per-row task catches its own exceptions and returns a typed `ReclaimOutcome` Result** — exceptions never escape into TaskGroup (which would cancel siblings and lose their in-flight results). A single slow or crashing `get_status` never head-of-line-blocks the sweep. **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
+- **Stuck reclaim** runs on a background sweep, NEVER on the dispatch critical path. When `DIALING` exceeds `max_call_duration + 30s`, FIRST call `provider.get_status(call_id)` as a **best-effort confirm** (configurable timeout `STUCK_RECLAIM_GET_STATUS_TIMEOUT_SECONDS`, bounded well under the sweep interval so a provider brownout doesn't degrade the sweep). Correctness does NOT depend on bypassing provider-side caches — it depends on the grace window being wider than any plausible provider cache TTL plus the epoch CAS at apply time. On timeout or error, treat the result as unknown and proceed to reclaim.
+  - **Terminal-apply branch** (provider returned COMPLETED / FAILED / NO_ANSWER / BUSY): `UPDATE calls SET status = $terminal, updated_at = NOW() WHERE id = $id AND status = 'DIALING' AND attempt_epoch = $epoch RETURNING *`. SAME `attempt_epoch`, no bump. If the CAS no-ops (a webhook arrived mid-sweep and already moved the row), that's the correct outcome — nothing to do.
+  - **Reclaim branch** (provider returned unknown / still-dialing): `UPDATE calls SET status = 'QUEUED', attempt_epoch = attempt_epoch + 1, updated_at = NOW() WHERE id = $id AND status = 'DIALING' AND attempt_epoch = $epoch RETURNING *`. Bumps the epoch; the subsequent claim primitive will bump once more on redial (producing a new idempotency key). If the CAS no-ops, the row already moved — abort the reclaim.
+  - **UPDATE the same row in place** — never INSERT + DELETE; the phone-level partial unique index would collide on INSERT.
+  - The sweep fans out across stuck rows via `asyncio.TaskGroup`, but **each per-row task catches its own exceptions and returns a typed `ReclaimOutcome` Result** — exceptions never escape into TaskGroup (which would cancel siblings and lose their in-flight results). A single slow or crashing `get_status` never head-of-line-blocks the sweep.
 - **Idempotency key** at provider port = `f"{call_id}:{attempt_epoch}"`.
 - **Phone-level in-flight guard**: unique partial index on `(phone) WHERE status IN ('QUEUED','DIALING','IN_PROGRESS')`.
 - **Webhook**: ack-then-process via `webhook_inbox` with `provider_event_id UNIQUE`.
@@ -140,11 +144,11 @@ pre-commit install
 
 ## Git commit discipline
 
-**Commits are written for the evaluator, not for our internal process.** The commit history is a design-decision log a reviewer can walk through to see how the system evolved. Never reference internal workflow artifacts (agent names, iteration numbers, review-process shorthand). Describe the DESIGN CHANGE and the reason, in design terms.
+**Commits are written for the evaluator reading the final repo.** Each commit explains WHAT the change is and WHY it's correct — not HOW we arrived at it. The review process that produced the change (AI tooling, agentic coding, iteration counters, internal reviewers, any workflow machinery) is invisible to the evaluator and MUST NOT appear in commit messages. A reviewer walking the commit history sees a deliberate progression of design decisions; nothing more, nothing less.
 
 - **One logical change per commit.** Unrelated edits go in separate commits.
 - **Subject ≤ 50 chars, imperative mood** (`Harden reclaim against stale cache`, not `Fixed the reclaim stuff`). Blank line, then a body.
-- **The body explains the WHY** — a future reader shouldn't need conversation history. Cite the design reason: a concrete failure scenario, a rubric dimension, an assignment requirement, a production pattern (Twilio / Retell / Vapi style) — never who surfaced it internally.
+- **Body = what + why.** State the behavior before and after, and the design reason: a concrete failure scenario, a rubric dimension, an assignment requirement, a production pattern (Twilio / Retell / Vapi). No conversation history, no process references, no internal shorthand.
 - **Never bypass pre-commit** (`--no-verify`). Fix the hook failure.
 - **Never amend already-pushed commits.** Create a new commit instead.
 

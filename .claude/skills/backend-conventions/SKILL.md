@@ -151,7 +151,7 @@ RETURNING *;
 ## Configuration
 
 - `app/config.py` reads env vars at startup; exposes a frozen `Settings` dataclass.
-- Defaults live here, not scattered across modules: `MAX_CONCURRENT_DEFAULT`, `STUCK_RECLAIM_SECONDS`, `STUCK_RECLAIM_GET_STATUS_TIMEOUT_SECONDS`, `MAX_RETRIES_DEFAULT`, `RETRY_BACKOFF_BASE_SECONDS`, `SCHEDULER_IDLE_INTERVAL_MS`, `SCHEDULER_SAFETY_NET_SECONDS`.
+- Defaults live here, not scattered across modules: `MAX_CONCURRENT_DEFAULT`, `MAX_CALL_DURATION_SECONDS` (source for the reclaim grace window), `STUCK_RECLAIM_SECONDS` (grace = `MAX_CALL_DURATION_SECONDS + 30`), `STUCK_RECLAIM_GET_STATUS_TIMEOUT_SECONDS`, `MAX_RETRIES_DEFAULT`, `RETRY_BACKOFF_BASE_SECONDS`, `SCHEDULER_IDLE_INTERVAL_MS`, `SCHEDULER_SAFETY_NET_SECONDS`.
 
 ## FastAPI lifespan owns pools
 
