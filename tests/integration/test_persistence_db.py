@@ -165,7 +165,7 @@ class TestCampaignRepo:
             await CallRepo.create_batch(
                 conn,
                 campaign_id=campaign_id,
-                phones=[f"+1415555{i:04d}" for i in range(6)],
+                phones=[f"+1415555{i:04d}" for i in range(8)],
                 retries_remaining=3,
             )
             # Move specific rows into terminal / in-flight states via raw UPDATE —
@@ -196,21 +196,42 @@ class TestCampaignRepo:
             )
             await conn.execute(
                 """
-                UPDATE calls SET status = 'IN_PROGRESS', attempt_epoch = 1
+                UPDATE calls SET status = 'NO_ANSWER', attempt_epoch = 3
                 WHERE campaign_id = $1 AND phone = $2
                 """,
                 campaign_id,
                 "+14155550003",
             )
+            await conn.execute(
+                """
+                UPDATE calls SET status = 'BUSY', attempt_epoch = 2
+                WHERE campaign_id = $1 AND phone = $2
+                """,
+                campaign_id,
+                "+14155550004",
+            )
+            await conn.execute(
+                """
+                UPDATE calls SET status = 'IN_PROGRESS', attempt_epoch = 1
+                WHERE campaign_id = $1 AND phone = $2
+                """,
+                campaign_id,
+                "+14155550005",
+            )
             # The last two stay QUEUED with epoch 0.
         stats = await CampaignRepo.stats(pool, campaign_id)
-        assert stats.total == 6
+        assert stats.total == 8
         assert stats.completed == 2
-        assert stats.failed == 1
-        # 1 + 2 + 4 + 1 + 0 + 0 = 8 attempts made across all rows.
-        assert stats.retries_attempted == 8
+        # failed aggregates FAILED + NO_ANSWER + BUSY so it matches the
+        # external status mapping on /calls/{id} ({completed, failed,
+        # in_progress} — total always == completed + failed + in_progress).
+        assert stats.failed == 3
+        # 1 + 2 + 4 + 3 + 2 + 1 + 0 + 0 = 13 attempts made across all rows.
+        assert stats.retries_attempted == 13
         # QUEUED x2 + IN_PROGRESS x1 = 3 rows in flight / waiting.
         assert stats.in_progress == 3
+        # Invariant: the three buckets partition the total.
+        assert stats.completed + stats.failed + stats.in_progress == stats.total
 
 
 # -- CallRepo ----------------------------------------------------------------

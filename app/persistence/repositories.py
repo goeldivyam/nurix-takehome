@@ -292,13 +292,16 @@ class CampaignRepo:
     async def stats(api_pool: asyncpg.Pool, campaign_id: UUID) -> CampaignStats:
         # Single aggregate pass. `retries_attempted` sums attempt_epoch across
         # every call row — each row's epoch counts the total attempts made for
-        # that row, including the initial dial.
+        # that row, including the initial dial. `failed` aggregates every
+        # terminal non-success (FAILED + NO_ANSWER + BUSY) so it matches the
+        # external status mapping exposed by /calls/{id} — completed + failed
+        # + in_progress always sum to total.
         row = await api_pool.fetchrow(
             """
             SELECT
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
-                COUNT(*) FILTER (WHERE status = 'FAILED') AS failed,
+                COUNT(*) FILTER (WHERE status IN ('FAILED', 'NO_ANSWER', 'BUSY')) AS failed,
                 COALESCE(SUM(attempt_epoch), 0) AS retries_attempted,
                 COUNT(*) FILTER (
                     WHERE status IN ('QUEUED', 'DIALING', 'IN_PROGRESS', 'RETRY_PENDING')
