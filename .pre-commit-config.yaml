@@ -1,0 +1,40 @@
+# Pre-commit hooks for the Nurix outbound voice campaign take-home.
+# Install once with:  pip install pre-commit && pre-commit install
+# Update versions with:  pre-commit autoupdate
+#
+# Runs on every `git commit`. Bypass with `--no-verify` is DISALLOWED
+# (see CLAUDE.md). If a hook fails, fix the underlying issue.
+
+repos:
+  # Basic hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: mixed-line-ending
+
+  # Python — ruff (lint + format). Replaces black / flake8 / isort / pyupgrade.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Frontend — ESLint (enable when a frontend/ module is added).
+  # Mirrors prod-email: eslint on src/**/*.{js,jsx}. Run via npm script so
+  # config in frontend/.eslintrc.js + frontend/package.json stay the source of truth.
+  # - repo: local
+  #   hooks:
+  #     - id: eslint
+  #       name: eslint (frontend)
+  #       entry: npm --prefix frontend run lint
+  #       language: system
+  #       files: '^frontend/src/.*\.(js|jsx|ts|tsx)$'
+  #       pass_filenames: false

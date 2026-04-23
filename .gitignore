@@ -48,3 +48,7 @@ env/
 # Misc
 tmp/
 .cache/
+
+# Scratch / temp files (per CLAUDE.md convention — prefix with _tmp or _test)
+_tmp_*
+_test_*

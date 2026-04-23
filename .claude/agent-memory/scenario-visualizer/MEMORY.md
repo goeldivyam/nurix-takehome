@@ -1,0 +1,4 @@
+- [Project context](project_nurix_takehome.md) — Nurix.ai Principal Engineer take-home; outbound voice campaign microservice
+- [Strawman v1 design](project_strawman_v1.md) — Python/FastAPI/asyncpg/Postgres single-process, DRR+SKIP LOCKED spine
+- [Gaps surfaced on strawman v1](project_gaps_strawman_v1.md) — 4 High/Critical gaps, 3 Medium-Low, verdict FIX-AND-ACCEPT
+- [User preference: short actionable output](feedback_output_style.md) — no exhaustive timelines unless Critical gap requires it

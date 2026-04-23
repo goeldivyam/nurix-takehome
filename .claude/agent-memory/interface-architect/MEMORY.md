@@ -1,0 +1,2 @@
+- [Nurix.ai take-home project](project_nurix_takehome.md) — local-only outbound voice campaign microservice; Python/FastAPI/asyncpg; invariants around scheduler/provider/state isolation
+- [Response style](feedback_response_style.md) — terse architectural reviews, honor word budgets, pseudocode signatures only, no implementation code
