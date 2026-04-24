@@ -122,17 +122,18 @@ Calls retry on outcomes that might succeed on redial; they fail hard on outcomes
 
 ## Fault tolerance
 
-- **Webhook ordering is not guaranteed.** Stale or out-of-order events silently no-op via the state machine's optimistic lock. Terminal state always wins.
-- **Stuck-call reclaim.** A `DIALING` row older than `max_call_duration + 30s` gets a best-effort `get_status` confirm before the epoch is bumped. Terminal result applies at the same epoch; unknown / timeout reclaims.
+- **Webhook ordering is not guaranteed.** Stale or out-of-order events silently no-op via the state machine's check-before-change rule (see Layers). Once a call reaches a terminal status, later events can't move it — done is done.
+- **Stuck-call reclaim.** If a call has been stuck in `DIALING` for too long (`max_call_duration + 30s`), a background sweep asks the provider `get_status` as a safety check. If the provider confirms a terminal status, we apply it; if it returns unknown or times out, we requeue the call for a fresh dial attempt.
 - **Idempotency.** Every provider-facing dial carries `idempotency_key = f"{call_id}:{attempt_epoch}"`. A retry on the same attempt returns the same handle.
-- **Commit-then-spawn webhook ingest.** The inbox row commits before the processor task is spawned — no race between insert and dequeue. A periodic safety-net sweep picks up any orphan between commit and spawn.
+- **Commit-then-spawn webhook ingest.** The inbox row is committed before the webhook processor task is spawned — otherwise the processor could try to read a row that isn't visible yet. A periodic safety-net sweep picks up any row left behind if the process crashes between the two steps.
 
 ---
 
 ## Scalability
 
-- **Horizontal replicas.** Run N app containers against one Postgres. The claim already uses `SKIP LOCKED`; the count-then-claim concurrency gate needs a per-campaign advisory lock to stay safe under multi-replica (documented as future work).
-- **Pool separation.** Already in place. Sizes are env-driven so each role can be tuned independently.
+- **Horizontal replicas.** Run N app containers against one shared Postgres. All replicas see all campaigns — there's no partitioning. Each replica runs its own scheduler loop and races to claim work from the shared `calls` table; `SELECT … FOR UPDATE SKIP LOCKED` ensures no two replicas dial the same row. Work spreads naturally across replicas.
+- **One gap** in the multi-replica story: the scheduler checks `max_concurrent` by counting in-flight calls, then claiming. In a single process that's race-free. In multi-replica, two ticks can count at the same moment, both decide "one slot left," and both claim — briefly exceeding the cap. Fix (future work): wrap the count + claim in a per-campaign advisory lock so only one replica counts-and-claims for a given campaign at a time.
+- **Pool separation.** Three asyncpg pools (api / scheduler / webhook) so a webhook burst or a long audit scan can't starve the scheduler. Sizes are env-driven so each role can be tuned independently.
 - **Cursor-based pagination.** `/audit` and `/campaigns` use keyset pagination, so new rows arriving mid-scan don't shift pages.
 
 ---
