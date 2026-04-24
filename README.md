@@ -24,7 +24,7 @@ All of the following run inside **one FastAPI process** sharing **one asyncio ev
 
 **State machine.** The single function allowed to change a call's status. Every caller (scheduler, webhook processor, reclaim) goes through it. On each transition it atomically checks the transition is allowed (optimistic lock on status + attempt number), updates the row, and writes the matching audit row in the same transaction — so you never see a status change without its reason. When the last call in a campaign terminates, it rolls the campaign up to `COMPLETED` or `FAILED`.
 - *Call states:* `QUEUED → DIALING → IN_PROGRESS → COMPLETED | FAILED`; retryable outcomes detour through `RETRY_PENDING → QUEUED`.
-- *Campaign states:* `PENDING → ACTIVE → COMPLETED | FAILED`.
+- *Campaign states:* `PENDING → ACTIVE → COMPLETED | FAILED`. A campaign is `COMPLETED` if any call succeeded; `FAILED` if every call failed.
 
 **Audit log.** Append-only table of every decision, skip, transition, and webhook outcome. **The audit log is the visualization** — the `/ui` page is a filterable, paginated view over it.
 
