@@ -1,442 +1,212 @@
 # Nurix Voice Campaign Microservice
 
-A local-only outbound-call campaign microservice built against a single
-Postgres and a mock telephony provider. Campaigns group phone numbers
-and dial them under a per-campaign concurrency cap, a weekly business-hour
-schedule, and a configurable retry policy; failed retries beat new calls at
-the system level so no campaign starves another during a retry storm. The
-scheduler, state machine, webhook processor, and reclaim sweep all run
-inside one FastAPI process and coordinate through Postgres advisory
-semantics (`SELECT … FOR UPDATE SKIP LOCKED`, CAS on `(status,
-attempt_epoch)`, the `webhook_inbox` table). The audit log is the
-visualization: every scheduler decision, every state transition, and every
-webhook outcome lands in `scheduler_audit` and is rendered live in a
-two-tab HTML view at `/ui`.
+Upload a list of phone numbers, set business hours and a retry policy, and the service dials them at the right time — respecting per-campaign concurrency caps, retrying failed calls before starting new ones, and logging every decision so you can see exactly what happened.
 
 ---
 
-## Setup
+## The layers
 
-```bash
-# 1. Virtual env + deps (Python 3.11+)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+All of the following run inside **one FastAPI process** sharing **one asyncio event loop** and a **single Postgres database**.
 
-# 2. Config
-cp .env.example .env
+**Frontend.** Plain HTML / JS / CSS served at `/ui`. No framework, no build step. The page is a thin view over the audit log.
 
-# 3. Bring the stack up (Postgres + app, healthcheck gated)
-make up
+**Backend API.** FastAPI routes for campaign CRUD, call status, per-campaign stats, audit reads, and webhook ingest. OpenAPI docs at `/docs`.
 
-# 4. Sanity check
-curl -s localhost:8001/health
-# -> {"status":"ok","pools":{"api":{...},"scheduler":{...},"webhook":{...}}}
+**Scheduler.** A background task that decides which call to dial next. Runs on the same event loop as the HTTP routes — not a separate server, not Celery. Wakes instantly when a call completes so freed concurrency slots are reused immediately ("continuous channel reuse").
 
-# 5. Open the operator UI
-open http://localhost:8001/ui
+**Dialer.** The `TelephonyProvider` interface — a Python port with `place_call` and `get_status`. The scheduler calls it as a regular function. In production it would be a Twilio / Vapi / Retell adapter; locally it's the mock.
+
+**Listener + webhook processor.**
+- *Listener* = `POST /webhooks/provider`, an HTTP endpoint. When the provider pushes a status update, the listener writes it to the `webhook_inbox` table and returns `200` immediately.
+- *Processor* = a background task that drains the inbox, turns each event into a state transition, and wakes the scheduler.
+
+*Spec deviation — honest note.* The assignment describes two provider APIs: trigger a call and check status (a polling model). We added the webhook path because every real provider (Twilio, Vapi, Retell) pushes updates, and push-based events support continuous channel reuse better than periodic polling. The polling API is still used — the stuck-call reclaim sweep calls `get_status` as a best-effort confirm before reclaiming. Swapping the whole path back to polling is ~50 lines: a loop over `DIALING` rows calling `get_status` and feeding the same state machine.
+
+**State machine.** The single function allowed to change a call's status. Every caller (scheduler, webhook processor, reclaim) goes through it. On each transition it atomically checks the transition is allowed (optimistic lock on status + attempt number), updates the row, and writes the matching audit row in the same transaction — so you never see a status change without its reason. When the last call in a campaign terminates, it rolls the campaign up to `COMPLETED` or `FAILED`.
+- *Call states:* `QUEUED → DIALING → IN_PROGRESS → COMPLETED | FAILED`; retryable outcomes detour through `RETRY_PENDING → QUEUED`.
+- *Campaign states:* `PENDING → ACTIVE → COMPLETED | FAILED`.
+
+**Audit log.** Append-only table of every decision, skip, transition, and webhook outcome. **The audit log is the visualization** — the `/ui` page is a filterable, paginated view over it.
+
+**Mock provider.** Stands in for Twilio. Implements `place_call` (accepts the dial, returns a handle) and `get_status` (used by the reclaim sweep). At dispatch it pre-rolls the outcome and fires simulated events on a timer:
+- *Happy path:* `DIALING` → sleep → `IN_PROGRESS` → sleep → `COMPLETED` (full duration).
+- *Failure paths:* `DIALING` → sleep → terminal (`FAILED` / `NO_ANSWER`), skipping `IN_PROGRESS`.
+- *Fixed timing* — 3s per call by default, 15s in demo mode. No jitter.
+- *Not simulated:* `BUSY`, provider rejections (invalid number, blocked), infrastructure timeouts. The classifier handles them if they arrive; the mock just doesn't generate them.
+
+---
+
+## Architecture
+
 ```
-
-Host ports are `8001` (app) and `5442` (Postgres) to avoid colliding with
-other local services; set `HOST_APP_PORT` / `HOST_PG_PORT` to remap. Inside
-the container the app still listens on `8000`.
-
-Common commands:
-
-```bash
-make up           # build + start postgres + app, wait for /health
-make down         # stop + remove
-make logs         # tail app logs
-make reset-db     # DROP SCHEMA public + re-apply schema.sql against the live DB
-make test         # pytest (unit + integration + e2e) in the host venv
-make lint         # ruff + ruff-format --check + mypy app/
-make format       # ruff format + ruff --fix
-make demo-fairness
-make demo-reclaim
-make demo-reset
-```
-
----
-
-## Demo in 10 minutes
-
-Three `make demo-*` targets drive the three behaviors rubric reviewers are
-most likely to probe.
-
-1. **`make demo-reset`** — wipes campaigns / calls / scheduler state / the
-   webhook inbox / the audit log so a fresh demo starts from a clean
-   chronology. Run this before either of the other two.
-
-2. **`make demo-fairness`** — seeds two campaigns with different
-   concurrency caps and a non-zero failure rate, then prints three
-   pre-filtered `/ui` URLs, each with a one-line narrative:
-   - `/ui/#audit?event_type=DISPATCH` — per-campaign DISPATCH counts
-     track the `max_concurrent` ratio (A=3, B=2), not the phone-count
-     ratio. Each campaign saturates to its cap in parallel.
-   - `/ui/#audit?campaign_id=<A>&event_type=RETRY_DUE,DISPATCH` — each
-     `RETRY_DUE` is followed within the next tick by a `DISPATCH` on the
-     same call id. Retries beat new calls at the system level.
-   - `/ui/#audit?campaign_id=<A>&event_type=CLAIMED,TRANSITION` — each
-     `CLAIMED` row follows the nearest prior terminal `TRANSITION` on the
-     same campaign within ~1s (safety-net + wake-notify). Every `CLAIMED`
-     row's `extra.in_flight_at_claim` is `≤ max_concurrent − 1`.
-
-3. **`make demo-reclaim`** — seeds one campaign, polls `GET /calls/{id}`
-   until the call reaches `in_progress` (the external mapping for
-   internal `DIALING`), then calls `/debug/age-dialing/{id}?by_seconds=900`
-   to rewind `updated_at`. With `DEMO_MODE=true` the reclaim sweep runs
-   every 5s, so a `RECLAIM_EXECUTED` (or `RECLAIM_SKIPPED_TERMINAL` if a
-   webhook beats the sweep) audit row lands within ~10s of aging. The
-   script narrates the wait and prints the filtered `/ui` URL.
-
----
-
-## Example API usage
-
-The API is documented at `http://localhost:8001/docs` (OpenAPI). Minimal
-curl examples:
-
-```bash
-# Create a campaign. All phones must be E.164 with +cc — Nurix runs
-# India and US campaigns so the validator rejects bare 10-digit numbers
-# outright rather than guessing a default region.
-curl -s -X POST http://localhost:8001/campaigns \
-  -H 'content-type: application/json' \
-  -d '{
-    "name": "nyc-morning",
-    "timezone": "America/New_York",
-    "schedule": {
-      "mon": [{"start":"09:00","end":"17:00"}],
-      "tue": [{"start":"09:00","end":"17:00"}],
-      "wed": [{"start":"09:00","end":"17:00"}],
-      "thu": [{"start":"09:00","end":"17:00"}],
-      "fri": [{"start":"09:00","end":"17:00"}],
-      "sat": [], "sun": []
-    },
-    "max_concurrent": 5,
-    "retry_config": {"max_attempts": 2, "backoff_base_seconds": 30},
-    "phones": ["+14155550001","+919876543210"]
-  }'
-
-# List campaigns (cursor-paginated, api_pool).
-curl -s 'http://localhost:8001/campaigns?limit=20'
-
-# Per-campaign aggregate stats — the shape the assignment specifies.
-curl -s http://localhost:8001/campaigns/<id>/stats
-# -> {"total":2,"completed":1,"failed":0,"retries_attempted":1,"in_progress":1}
-
-# Call-level status (external mapping: in_progress | completed | failed).
-curl -s http://localhost:8001/calls/<id>
-
-# Audit log — the visualization. Filters AND-compose; event_type is OR
-# within a comma-separated list.
-curl -s 'http://localhost:8001/audit?event_type=CLAIMED,DISPATCH&limit=50'
-
-# Simulate an inbound provider webhook (mock).
-curl -s -X POST http://localhost:8001/webhooks/provider \
-  -H 'content-type: application/json' \
-  -d '{"provider_event_id":"e-1","provider_call_id":"mock-xxx","status":"COMPLETED"}'
+ Browser
+    │
+    │ HTTP
+    ▼
+ ┌─ FastAPI process ─────────────────────────────────┐
+ │  (one asyncio event loop)                         │
+ │                                                   │
+ │    HTTP routes  ─────┐                            │
+ │    Scheduler loop  ──┤                            │
+ │    Webhook proc.   ──┼──▶  State machine          │
+ │    Reclaim sweep   ──┘         │                  │
+ │                                │                  │
+ │    Dialer (port)  ──▶  Mock provider              │
+ │         ▲                  │                      │
+ │         │  simulated events│                      │
+ │         └──────────────────┘                      │
+ └──────────────────────┬────────────────────────────┘
+                        │ asyncpg
+                        ▼
+                    Postgres
+        (campaigns, calls, scheduler_audit,
+         webhook_inbox, scheduler_campaign_state)
 ```
 
 ---
 
-## System design
+## Database tables
 
-### Six-layer architecture
+Full DDL lives in `schema.sql`.
 
-| Layer | Responsibility |
-|---|---|
-| `app/api` | FastAPI routers + Pydantic request/response schemas. No business logic. |
-| `app/persistence` | Three asyncpg pools (`api` / `scheduler` / `webhook`) + repositories. Only SQL. |
-| `app/scheduler` | Tick pipeline, wake signal, stuck-call reclaim, webhook processor. |
-| `app/state` | Sole mutator of `calls` and `campaigns`. CAS transitions + same-txn audit. |
-| `app/provider` | `TelephonyProvider` Protocol + `MockProvider` in-process adapter. |
-| `app/audit` | Emitter (writes on the caller's connection) + paginated reader. |
+- **`campaigns`** — campaign config (schedule, concurrency cap, retry policy) + lifecycle status.
+- **`calls`** — one row per phone per campaign. Status, attempt number, retries remaining. A partial unique index on `(phone)` prevents the same number being dialed twice at once.
+- **`scheduler_campaign_state`** — round-robin cursor per campaign so dispatch order survives restarts.
+- **`webhook_inbox`** — accepted provider events, keyed by `(provider, provider_event_id)` so replays are idempotent.
+- **`scheduler_audit`** — append-only log of every decision and transition. Backs the UI.
 
-Shared types live at the layer that owns them: `CallStatus` and
-`CampaignStatus` in `app/state/types.py`, `AuditEvent` in
-`app/audit/events.py`, `CallHandle` / `ProviderEvent` /
-`ProviderRejected` / `ProviderUnavailable` in `app/provider/types.py`.
+---
 
-### Scheduler pipeline
+## How the scheduler works
 
-Every wake runs one tick. One dispatch per tick keeps the cursor math
-simple and the audit trail one-to-one with decisions.
+**The loop.** Wait for a wake signal (or a safety-net timeout), clear the flag, run one tick, repeat. Clearing *before* the tick — not after — means a wake arriving during a tick is captured for the next iteration. No lost wakeups.
 
-1. **Eligibility** — `CampaignRepo.list_eligible_for_tick` returns every
-   campaign in status `{PENDING, ACTIVE}` joined with
-   `scheduler_campaign_state.last_dispatch_at` so the RR cursor is
-   available without a second read.
-2. **Business-hour gate** — `is_in_window` converts UTC into the
-   campaign's `ZoneInfo`, picks today's local weekday, and accepts if
-   the current time falls inside any `[start, end)` window.
-3. **Concurrency gate** — ONE `in_flight_counts_by_campaign` GROUP BY
-   call returns `{campaign_id: count}`. Campaigns where `count >=
-   max_concurrent` are dropped. No N+1 as the fleet grows.
-4. **Retry sweep** — among survivors, intersect with
-   `find_retry_due_campaign_ids`; the oldest-last-dispatch wins the RR
-   cursor tiebreak. If a retry wins, transition its oldest
-   `RETRY_PENDING`-due row back to `QUEUED` via `state.transition`
-   (emits a `RETRY_DUE` audit) so the next step's claim primitive
-   picks it up.
-5. **Round-robin pick** — if no retry won, pick the campaign with the
-   oldest `last_dispatch_at` (a null cursor wins over any concrete value,
-   so a brand-new campaign doesn't wait).
+**The wake signal.** The state machine and webhook processor call `wake.notify()` after every terminal transition. That's what delivers continuous channel reuse: the scheduler reacts to completions in milliseconds, not batches.
 
-The picked campaign runs through **three-phase dispatch** — the pattern
-that lets the scheduler scale horizontally without holding DB
-connections across provider latency:
+**One tick.**
 
-- **Phase 1** (scheduler_pool txn): snapshot pre-claim counts, run the
-  SKIP LOCKED claim primitive, emit the `CLAIMED` audit row on the same
-  connection. If the claim returns `None`, the row drained between
-  eligibility read and claim — silent no-op.
-- **Phase 2** (no DB txn): `provider.place_call(idempotency_key, phone)`
-  where `idempotency_key = f"{call_id}:{attempt_epoch}"`. Catches
-  `ProviderRejected` and `ProviderUnavailable`.
-- **Phase 3** (scheduler_pool txn): apply the outcome via
-  `state.transition`. OK → DISPATCH audit + `provider_call_id` recorded.
-  REJECTED → FAILED. UNAVAILABLE → RETRY_PENDING if budget remains, else
-  FAILED-exhausted. `scheduler_campaign_state.last_dispatch_at` updates
-  here so the cursor is persisted across process restarts.
+1. **Eligibility.** Find campaigns in `PENDING` / `ACTIVE`, in business hours right now, with work to do.
+2. **Concurrency gate.** Drop any campaign already at its `max_concurrent`. Retries and new calls both pass through this gate — a retry on a saturated campaign waits exactly like a new call.
+3. **Retry sweep.** Among survivors, if any campaign has a retry whose backoff has elapsed, pick it first. **Retries beat new calls at the system level**, not per-campaign. When multiple campaigns have retries due, the same round-robin cursor decides who wins — no campaign's retry backlog monopolizes the slot.
+4. **Round-robin pick.** Otherwise pick the campaign with the oldest `last_dispatch_at`.
+5. **Dispatch.** Claim the row, call the provider, record the outcome. One dispatch per tick. Every step writes an audit row with its reasoning.
 
-### State model
+---
 
-**Call** — `QUEUED → DIALING → IN_PROGRESS → COMPLETED | FAILED`.
-Failures with retries remaining go `DIALING → RETRY_PENDING` and return
-to `QUEUED` when the backoff elapses. `NO_ANSWER` / `BUSY` are
-retryable. `attempt_epoch` increments at two well-defined sites — the
-claim primitive (QUEUED → DIALING) and the stuck-reclaim branch
-(DIALING → QUEUED) — producing a distinct idempotency key per
-provider-facing dial attempt.
+## Retry handling
 
-**Campaign** — `PENDING → ACTIVE → COMPLETED | FAILED`. The first
-`QUEUED → DIALING` transition on any of a campaign's calls promotes
-the campaign `PENDING → ACTIVE` atomically in the same transaction.
-Every terminal call transition runs a rollup in the same transaction:
-if the campaign has no calls in `{QUEUED, DIALING, IN_PROGRESS,
-RETRY_PENDING}`, CAS the campaign to `COMPLETED` (any success) or
-`FAILED` (all terminal calls failed). The CAS on `status='ACTIVE'`
-serializes the last-two-terminal race — only one caller wins and
-emits the `CAMPAIGN_COMPLETED` audit row.
+Calls retry on outcomes that might succeed on redial; they fail hard on outcomes that won't.
 
-### Crash safety
-
-- **Idempotency key** at the provider port is always
-  `f"{call_id}:{attempt_epoch}"`. A retry on the same attempt returns
-  the same provider handle; a re-dial after epoch bump gets a fresh key.
-- **Phone-level in-flight guard** — `UNIQUE(phone) WHERE status IN
-  ('QUEUED','DIALING','IN_PROGRESS')`. A second campaign can't re-dial
-  a number that's already in flight; `COMPLETED` / `FAILED` rows don't
-  count so history is preserved.
-- **Stuck-call reclaim** runs on a separate timer
-  (`reclaim_sweep_interval_seconds`, independent of the tick's safety
-  net). For every `DIALING` row older than
-  `max_call_duration + 30s`: null `provider_call_id` → reclaim branch
-  (epoch bump) directly; otherwise `provider.get_status()` with a hard
-  timeout — terminal result applies at the same epoch (no bump), unknown
-  or timeout bumps the epoch and requeues. Each per-row task wraps
-  `try/except BaseException` so one slow `get_status` never
-  head-of-line-blocks the sweep.
-- **Webhook ingest** — `/webhooks/provider` runs (1) verify signature,
-  (2) INSERT into `webhook_inbox` inside a transaction, (3) AFTER commit
-  spawn `process_pending_inbox` as a tracked task. Spawning before
-  commit would race — the processor could dequeue before the row is
-  visible. A periodic safety-net loop picks up anything orphaned by a
-  crash between commit and task spawn. The
-  `UNIQUE(provider, provider_event_id)` index + ON CONFLICT makes
-  duplicate deliveries idempotent.
-- **Audit atomicity** — every state transition and its audit row are
-  written on the same connection inside the same transaction. Readers
-  never observe a transition without its reason.
-- **CLAIMED + DISPATCH pair** — the three-phase dispatch separates the
-  DB claim from the provider call. The CLAIMED audit closes the "every
-  transition emits one audit row in the same txn" invariant at Phase 1;
-  the DISPATCH audit at Phase 3 records the outcome. Every dispatched
-  call has exactly one CLAIMED and one DISPATCH paired by
-  `(call_id, attempt_epoch)`.
-
-### Audit log as visualization
-
-The plan's rubric point 7 ("audit log IS the visualization") is realized
-via `GET /audit` + the `/ui` two-tab bundle (see `frontend/`). Every
-scheduler decision, skip reason, webhook outcome, and transition lands
-in `scheduler_audit` as a structured row with typed `extra`. The UI
-renders them in a dense, filterable, cursor-paginated table so an
-operator can walk the causal chain of any campaign from creation to
-terminal rollup in under a minute.
+- **Retryable** — `NO_ANSWER`, `BUSY`, transient provider errors. The call moves to `RETRY_PENDING` with `next_attempt_at = NOW() + base × 2^attempt ± 20% jitter`.
+- **Terminal** — provider rejections (invalid number, blocked) or an explicit `FAILED` from the provider. The call moves straight to `FAILED`.
+- **Exhausted** — when `retries_remaining` hits zero, the next retryable outcome becomes `FAILED`.
 
 ---
 
 ## Tech choices
 
-- **Postgres only** — `SELECT … FOR UPDATE SKIP LOCKED` gives reliable
-  per-row queue semantics without a separate broker. No Celery, no
-  RabbitMQ, no Redis. One fewer moving part at take-home scope and a
-  documented horizontal-scale path (one Postgres, N app replicas).
-- **Single-process FastAPI** — API + scheduler tick + reclaim sweep +
-  webhook processor share one event loop. Cross-process coordination
-  deferred to the "add a second replica" future work; the advisory-lock
-  hook is already designed (see Scalability below).
-- **asyncpg** (not psycopg2) — required for async non-blocking DB I/O.
-- **Three asyncpg pools** — `api` / `scheduler` / `webhook`, so a
-  webhook burst or a long `/audit` scan can't starve the scheduler tick.
-  `/audit` reads go to `api_pool`, never `scheduler_pool`. Documented
-  exception: `POST /campaigns` writes the campaign row + its seed calls
-  on `scheduler_pool` because the batch enters the state machine's
-  space — calls are governed by `state.transition`, and the initial
-  insert populates that state space.
-- **Mock provider via in-process callback**, not HTTP loopback — the
-  mock invokes `handle_webhook_ingest(deps, payload, raw_body=b"",
-  headers={})` directly via an `event_sink` closure wired at lifespan
-  startup. No loopback port, no synthetic HMAC, unit tests stay
-  hermetic. Real adapters (Twilio / Retell / Vapi) would POST HTTP to
-  the same helper in production.
-- **No global CPS throttle** — the assignment specifies "maximum
-  concurrent calls … within a campaign." A global token bucket would
-  be spec-creep. Flagged as future work for providers that enforce a
-  global account rate.
-- **No weights between campaigns** — the assignment lists per-campaign
-  `max_concurrent`, per-campaign retry config, and per-campaign
-  business hours, but nothing about inter-campaign priority. "Fairness"
-  in the spec means retries-before-new inside the queue, which is the
-  scheduler's retry sweep. Adding a weight field is a one-line
-  extension; documented as future work.
-- **No pause/resume, no cancel** — not in the assignment. The
-  `TelephonyProvider` Protocol leaves `cancel(call_id)` off deliberately
-  because Twilio / Retell / Vapi diverge on cancel semantics; adding it
-  when a real adapter lands beats guessing its shape today.
-- **Phone normalization — +cc required** — Nurix operates India and US
-  campaigns in the same service. A bare 10-digit number is ambiguous
-  between the two dial plans, so the Pydantic validator rejects it
-  rather than guessing a default region. Each phone must carry its
-  country code (+1…, +91…) so the partial unique index on `(phone)` is
-  unambiguous.
-
-### Scope boundary — voice-AI stack
-
-This service is a **campaign orchestrator**. Its responsibility ends at
-the telephony boundary. The surfaces around it are explicit ports, not
-features we build here:
-
-- **`TelephonyProvider`** (the port in `app/provider/base.py`) is a
-  call-placement and call-status contract: `place_call`, `get_status`,
-  `aclose`. Swapping the mock for a real adapter (Twilio / Retell /
-  Vapi) is a one-file change with no scheduler / state edits.
-- **Conversation engine** (TTS / STT / LLM, barge-in, audio pipeline)
-  is out of scope — it sits behind its own `ConversationEngine` port
-  invoked by the telephony provider on media events, not by our
-  scheduler. The campaign layer passes a `script_ref` down through
-  `place_call` and the engine resolves the audio loop independently.
-  This matches how Retell and Vapi decompose the stack: telephony is
-  I/O-bound, conversation is GPU-bound; they scale and version
-  separately.
-- **Per-country routing**, **AMD sub-codes**, **global CPS throttle**,
-  **pause/resume** — all deferred. The abstractions support them; the
-  assignment's scope does not require them. See Future Work.
+- **Postgres only.** `SELECT … FOR UPDATE SKIP LOCKED` gives reliable per-row queue semantics without a broker.
+- **Single process.** One event loop runs API + scheduler + webhook processor + reclaim sweep. Scale horizontally by running N replicas against the same Postgres.
+- **asyncpg.** Async non-blocking DB I/O.
+- **Three DB pools** (api / scheduler / webhook). A webhook burst or a long audit scan can't starve the scheduler tick.
+- **Mock provider in-process.** No HTTP loopback. Tests stay hermetic; a real adapter would wire to the same ingest helper.
 
 ---
 
 ## Fault tolerance
 
-- **Webhook ordering is not guaranteed** — the state machine's CAS on
-  `(status, attempt_epoch)` silently no-ops stale or out-of-order events
-  and writes a `WEBHOOK_IGNORED_STALE` audit row with the
-  expected / actual state for forensic traceability. Terminal state
-  always wins; intermediate audit coverage is best-effort.
-- **Reclaim confirm-then-CAS** — the sweep always calls
-  `provider.get_status` before bumping the epoch. Terminal provider
-  results apply at the same epoch (no bump); only unknown / timeout
-  reclaims. The grace window (`max_call_duration + 30s`) is wider than
-  any plausible provider status-cache TTL.
-- **Idempotency key = `f"{call_id}:{attempt_epoch}"`** — increments
-  only at the two sites that actually dial (claim primitive and reclaim
-  branch). Retry requeue (`RETRY_PENDING → QUEUED`) does not bump; the
-  next claim handles it. Terminal transitions do not bump.
-- **Commit-then-spawn webhook ordering** — inbox INSERT commits before
-  the processor task spawns. The `UNIQUE(provider, provider_event_id)`
-  index makes duplicate deliveries idempotent. A periodic safety-net
-  sweep picks up anything orphaned between commit and spawn (say a crash
-  mid-request).
-- **Business-hour close with in-flight calls** — the gate only blocks
-  NEW dispatches. Calls already in `DIALING` / `IN_PROGRESS` drain
-  naturally to terminal; the scheduler doesn't touch them. Asserted by
-  the integration test
-  `test_business_hour_close_with_in_flight_does_not_dispatch_new`.
+- **Webhook ordering is not guaranteed.** Stale or out-of-order events silently no-op via the state machine's optimistic lock. Terminal state always wins.
+- **Stuck-call reclaim.** A `DIALING` row older than `max_call_duration + 30s` gets a best-effort `get_status` confirm before the epoch is bumped. Terminal result applies at the same epoch; unknown / timeout reclaims.
+- **Idempotency.** Every provider-facing dial carries `idempotency_key = f"{call_id}:{attempt_epoch}"`. A retry on the same attempt returns the same handle.
+- **Commit-then-spawn webhook ingest.** The inbox row commits before the processor task is spawned — no race between insert and dequeue. A periodic safety-net sweep picks up any orphan between commit and spawn.
 
 ---
 
 ## Scalability
 
-- **Horizontal replicas** — run N app containers against the same
-  Postgres. The claim primitive already uses `FOR UPDATE SKIP LOCKED`
-  so different ticks take different rows without serializing. The
-  count-then-claim concurrency gate becomes racy under multi-replica,
-  so the gate + claim should be wrapped in
-  `pg_try_advisory_xact_lock(hashtextextended(campaign_id::text, 0))`
-  — the 64-bit hash, not the 32-bit `hashtext`, so unrelated campaigns
-  don't collide in the 64-bit advisory-lock key space. Documented as
-  future work rather than built; single-process correctness is
-  established first.
-- **Pool separation** — the three-pool split (api / scheduler /
-  webhook) is already in place. Sizing is env-driven so an operator
-  can tune each role against its real traffic shape.
-- **Cursor-based pagination** — `GET /audit` and `GET /campaigns` use
-  `(ts, id) < cursor` so new rows arriving mid-pagination never
-  displace earlier pages. Shareable URLs carry the cursor so "view as
-  of this page" works.
-- **Webhook-inbox retention** — `webhook_inbox` is append-only and
-  needs a retention cleanup to stay bounded. The retention horizon is
-  `WEBHOOK_INBOX_RETENTION_DAYS` (default 7); the cleanup job itself is
-  flagged as future work — ops can run the delete manually until then.
+- **Horizontal replicas.** Run N app containers against one Postgres. The claim already uses `SKIP LOCKED`; the count-then-claim concurrency gate needs a per-campaign advisory lock to stay safe under multi-replica (documented as future work).
+- **Pool separation.** Already in place. Sizes are env-driven so each role can be tuned independently.
+- **Cursor-based pagination.** `/audit` and `/campaigns` use keyset pagination, so new rows arriving mid-scan don't shift pages.
 
 ---
 
-## Future work
+## Deliberately out of scope
 
-- **`TelephonyProvider.cancel(call_id)`** — for campaign abort.
-  Adapters diverge on semantics (Twilio "canceled" vs Retell "aborted"),
-  so the Protocol deliberately omits it until a real adapter lands.
-- **Per-country provider routing** — Nurix uses different providers
-  for India (+91) vs the US (+1). The abstraction is ready: the
-  `TelephonyProvider` Protocol is narrow, `deps.provider` is a single
-  instance today, and the lifespan is the one place to wire a
-  phone-prefix-routing dispatcher. Not built here because the
-  assignment scope is one mock.
-- **Promoting `parse_event` / `verify_signature` onto the Protocol** —
-  deferred until a second adapter lands so the shape can be grounded
-  rather than guessed.
-- **AMD (answering-machine detection) sub-codes** — enrich
-  `CallStatus` with `AMD_MACHINE`, `AMD_HUMAN` terminals once a
-  provider surfaces them.
-- **Weights between campaigns** — extend the RR cursor tiebreak into
-  a weighted-RR under a new `weight` field on `campaigns`. Not specced
-  by the assignment.
-- **Global CPS throttle** — a token bucket at the provider-adapter
-  layer for accounts that enforce a global rate.
-- **Pause / resume** — pausable campaigns with operator control.
-- **`webhook_inbox` retention cleanup task** — a daily job that
-  deletes / archives rows older than `WEBHOOK_INBOX_RETENTION_DAYS`.
-- **Per-campaign `max_call_duration` override** — currently global;
-  some providers or use-cases need a per-campaign ceiling.
+- **Cancel / pause / resume.** Not in the assignment; Twilio / Retell / Vapi diverge on cancel semantics, so the port leaves it out until a real adapter lands.
+- **Global calls-per-second throttle.** Assignment specifies per-campaign concurrency only.
+- **Inter-campaign weights.** Assignment specifies fairness within a campaign (retries first), not priority between campaigns.
+- **Conversation engine** (TTS / STT / LLM). Lives behind a separate `ConversationEngine` port. This service's job ends at the telephony boundary.
+
+---
+
+## Run it
+
+```bash
+# Python 3.11+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
+make up                           # build + start Postgres + app
+curl -s localhost:8001/health     # sanity check
+open http://localhost:8001/ui     # operator UI
+```
+
+Host ports are `8001` (app) and `5442` (Postgres). Override with `HOST_APP_PORT` / `HOST_PG_PORT`. Useful `make` targets: `up`, `down`, `logs`, `reset-db`, `test`, `lint`, `format`.
+
+---
+
+## Try it
+
+OpenAPI at `http://localhost:8001/docs`.
+
+```bash
+# Create a campaign.
+curl -s -X POST http://localhost:8001/campaigns \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "nyc-morning",
+    "timezone": "America/New_York",
+    "schedule": {"mon":[{"start":"09:00","end":"17:00"}]},
+    "max_concurrent": 5,
+    "retry_config": {"max_attempts": 2, "backoff_base_seconds": 30},
+    "phones": ["+14155550001","+919876543210"]
+  }'
+
+# Per-campaign stats (the shape the assignment specifies).
+curl -s http://localhost:8001/campaigns/<id>/stats
+# -> {"total":2,"completed":1,"failed":0,"retries_attempted":1,"in_progress":1}
+
+# Individual call status.
+curl -s http://localhost:8001/calls/<id>
+
+# Audit log.
+curl -s 'http://localhost:8001/audit?event_type=DISPATCH&limit=50'
+```
+
+---
+
+## Demo
+
+Three `make` targets exercise the behaviors worth watching:
+
+- **`make demo-reset`** — wipe campaigns / calls / audit for a clean chronology.
+- **`make demo-fairness`** — seed two campaigns with different concurrency caps and a non-zero failure rate. Prints filtered `/ui` URLs showing dispatch counts tracking the concurrency ratio, retries beating new calls, and continuous channel reuse after completions.
+- **`make demo-reclaim`** — seed one campaign, artificially age a `DIALING` row, and watch the reclaim sweep rescue it.
 
 ---
 
 ## Testing
 
 ```bash
-make test        # pytest: unit + integration + e2e
-make lint        # ruff + mypy
+make test   # unit + integration + e2e (testcontainers Postgres)
+make lint   # ruff + mypy
 ```
 
-The suite covers every scheduler invariant in the rubric —
-concurrency-gate starvation, retry-before-new at the system level,
-multi-retry RR fairness, continuous channel reuse via `wake.notify`,
-business-hour close with in-flight calls, the CLAIMED+DISPATCH
-(call_id, attempt_epoch) pair, PENDING→ACTIVE promotion under forced
-rollback, the last-two-terminal race producing exactly one
-`CAMPAIGN_COMPLETED` audit row, the reclaim null-handle short-circuit,
-and the retroactive-stale-event invariant. Integration tests run
-against testcontainers Postgres; the end-to-end test
-(`tests/e2e/test_full_stack.py`) drives the running docker-compose
-stack via HTTP.
+The suite covers the scheduler invariants:
+
+- Concurrency gate (no campaign exceeds `max_concurrent`).
+- Retries beat new calls at the system level, with round-robin fairness across campaigns.
+- Wake-driven reuse — a completed call is followed within milliseconds by the next dispatch.
+- Business-hour close with in-flight calls draining naturally rather than being cancelled.
