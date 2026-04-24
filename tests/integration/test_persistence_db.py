@@ -144,6 +144,17 @@ class TestCampaignRepo:
         completed_id = await _create_campaign(pool, name="completed")
         now = datetime.now(tz=UTC)
         async with pool.acquire() as conn:
+            # Eligibility requires at least one live call per campaign
+            # (the EXISTS filter excludes campaigns whose calls are all
+            # terminal or absent). Seed one QUEUED call per PENDING/ACTIVE
+            # campaign so the pre-existing intent of this test — verifying
+            # the scheduler_campaign_state LEFT JOIN — is preserved.
+            await CallRepo.create_batch(
+                conn, campaign_id=active_id, phones=["+14155550101"], retries_remaining=0
+            )
+            await CallRepo.create_batch(
+                conn, campaign_id=pending_id, phones=["+14155550102"], retries_remaining=0
+            )
             await CampaignRepo.transition_if(conn, active_id, "PENDING", "ACTIVE")
             await CampaignRepo.transition_if(conn, completed_id, "PENDING", "COMPLETED")
             await SchedulerStateRepo.update_last_dispatch_at(conn, active_id, now)
@@ -156,6 +167,43 @@ class TestCampaignRepo:
         pending_row = next(r for r in rows if r.id == pending_id)
         assert active_row.last_dispatch_at is not None
         assert pending_row.last_dispatch_at is None
+
+    async def test_list_eligible_for_tick_excludes_campaigns_with_no_live_calls(
+        self, pool: asyncpg.Pool
+    ) -> None:
+        # A PENDING or ACTIVE campaign whose calls are all in terminal
+        # states (or which has no calls yet) must be excluded from the
+        # eligibility set — otherwise the scheduler emits noise
+        # (SKIP_BUSINESS_HOUR / SKIP_CONCURRENCY rows about nothing) every
+        # tick for every such campaign. Business-hour-closed campaigns
+        # with QUEUED work are NOT affected: they still have live calls
+        # and so still appear in the eligibility set, where the
+        # business-hour gate correctly emits one SKIP per tick.
+        with_work_id = await _create_campaign(pool, name="with-work")
+        all_terminal_id = await _create_campaign(pool, name="all-terminal")
+        no_calls_id = await _create_campaign(pool, name="no-calls")
+        async with pool.acquire() as conn:
+            await CallRepo.create_batch(
+                conn,
+                campaign_id=with_work_id,
+                phones=["+14155550201"],
+                retries_remaining=0,
+            )
+            terminal_call_ids = await CallRepo.create_batch(
+                conn,
+                campaign_id=all_terminal_id,
+                phones=["+14155550202"],
+                retries_remaining=0,
+            )
+            await conn.execute(
+                "UPDATE calls SET status = 'COMPLETED' WHERE id = $1",
+                terminal_call_ids[0],
+            )
+            rows = await CampaignRepo.list_eligible_for_tick(conn)
+        ids = {r.id for r in rows}
+        assert with_work_id in ids
+        assert all_terminal_id not in ids
+        assert no_calls_id not in ids
 
     async def test_stats_matches_hand_counts(self, pool: asyncpg.Pool) -> None:
         campaign_id = await _create_campaign(pool)

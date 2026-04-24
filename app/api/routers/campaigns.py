@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.schemas.campaigns import (
+    CampaignCallResponse,
+    CampaignCallsListResponse,
     CampaignCreate,
     CampaignListResponse,
     CampaignResponse,
@@ -19,6 +21,21 @@ from app.persistence.repositories import CallRepo, CampaignRepo, CampaignRow
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 _WEEKDAY_KEYS: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+# External status mapping per assignment: the caller sees
+# pending / in_progress / completed / failed (the vocabulary the spec
+# enumerates). The internal state machine uses PENDING / ACTIVE /
+# COMPLETED / FAILED — those names stay in the DB, in the audit log's
+# state_before/state_after columns, and in the CAMPAIGN_PROMOTED_ACTIVE
+# audit event reason. Translation is an API-boundary concern, not a
+# core-enum concern, and mirrors the precedent in `calls.py`.
+_ExternalStatus = Literal["pending", "in_progress", "completed", "failed"]
+_EXTERNAL_STATUS_MAP: dict[str, _ExternalStatus] = {
+    "PENDING": "pending",
+    "ACTIVE": "in_progress",
+    "COMPLETED": "completed",
+    "FAILED": "failed",
+}
 
 
 def get_deps(request: Request) -> Deps:
@@ -46,7 +63,7 @@ def _row_to_response(row: CampaignRow) -> CampaignResponse:
     return CampaignResponse(
         id=row.id,
         name=row.name,
-        status=row.status,
+        status=_EXTERNAL_STATUS_MAP[row.status],
         timezone=row.timezone,
         schedule=schedule,
         max_concurrent=row.max_concurrent,
@@ -141,3 +158,50 @@ async def get_campaign_stats(
         retries_attempted=stats.retries_attempted,
         in_progress=stats.in_progress,
     )
+
+
+@router.get("/{campaign_id}/calls", response_model=CampaignCallsListResponse)
+async def list_campaign_calls(
+    campaign_id: UUID,
+    deps: DepsDep,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> CampaignCallsListResponse:
+    # Powers the per-campaign drill-in drawer. Surfaces the internal call
+    # status vocabulary (QUEUED / DIALING / IN_PROGRESS / RETRY_PENDING /
+    # terminal) so the operator can see the fine-grained lifecycle —
+    # externalising would collapse RETRY_PENDING into in_progress and hide
+    # the exact signal the drawer exists to show.
+    async with deps.pools.api.acquire() as conn:
+        exists = await CampaignRepo.get(conn, campaign_id)
+    if exists is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    rows, next_cursor = await CallRepo.list_for_campaign(deps.pools.api, campaign_id, cursor, limit)
+    calls = [
+        CampaignCallResponse(
+            id=r.id,
+            phone=r.phone,
+            # Pydantic validates r.status against the Literal on
+            # CampaignCallResponse. `cast` silences mypy on the str→Literal
+            # narrow; runtime validation still happens via Pydantic.
+            status=cast(
+                Literal[
+                    "QUEUED",
+                    "DIALING",
+                    "IN_PROGRESS",
+                    "RETRY_PENDING",
+                    "COMPLETED",
+                    "FAILED",
+                    "NO_ANSWER",
+                    "BUSY",
+                ],
+                r.status,
+            ),
+            attempt_epoch=r.attempt_epoch,
+            retries_remaining=r.retries_remaining,
+            next_attempt_at=r.next_attempt_at,
+            updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
+    return CampaignCallsListResponse(calls=calls, next_cursor=next_cursor)

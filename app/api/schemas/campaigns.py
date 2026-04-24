@@ -160,7 +160,11 @@ class CampaignCreate(BaseModel):
 class CampaignResponse(BaseModel):
     id: UUID
     name: str
-    status: str
+    # External-vocabulary enum surfaces in /openapi.json so generated
+    # clients can type-narrow. Internal DB column keeps the state-machine
+    # shape (PENDING / ACTIVE / COMPLETED / FAILED) and the router's
+    # `_EXTERNAL_STATUS_MAP` is the single boundary translator.
+    status: Literal["pending", "in_progress", "completed", "failed"]
     timezone: str
     schedule: dict[str, list[TimeWindow]]
     max_concurrent: int
@@ -174,15 +178,82 @@ class CampaignListResponse(BaseModel):
     next_cursor: str | None
 
 
+class CampaignCallResponse(BaseModel):
+    # Operator drill-in shape. The internal call-status vocabulary
+    # (DIALING / RETRY_PENDING / …) is surfaced here deliberately — the
+    # drawer is a deep operator view, and distinguishing RETRY_PENDING
+    # from QUEUED or DIALING from IN_PROGRESS is exactly the observability
+    # the rubric rewards. The external call status (in_progress / completed
+    # / failed) remains the shape surfaced by `GET /calls/{id}`.
+    #
+    # Provider-adapter vocabulary (`provider_call_id`) is intentionally
+    # absent from this response — it's a telephony-boundary field that
+    # doesn't belong in the campaign API. The operator correlates an
+    # individual call back to its provider trail via the `call_id` →
+    # audit-tab deep link, where the audit rows carry `provider_call_id`
+    # in `extra` as the forensic source of truth.
+    id: UUID
+    phone: str
+    status: Literal[
+        "QUEUED",
+        "DIALING",
+        "IN_PROGRESS",
+        "RETRY_PENDING",
+        "COMPLETED",
+        "FAILED",
+        "NO_ANSWER",
+        "BUSY",
+    ]
+    attempt_epoch: int
+    retries_remaining: int
+    next_attempt_at: datetime | None
+    updated_at: datetime
+
+
+class CampaignCallsListResponse(BaseModel):
+    calls: list[CampaignCallResponse]
+    next_cursor: str | None
+
+
 class CampaignStatsResponse(BaseModel):
-    total: int
-    completed: int
-    failed: int
-    retries_attempted: int
-    in_progress: int
+    total: int = Field(
+        description=(
+            "Total calls in the campaign, including those currently in flight and "
+            "any that have reached a terminal state. Invariant: "
+            "completed + failed + in_progress == total."
+        ),
+    )
+    completed: int = Field(
+        description=(
+            "Calls that reached COMPLETED. A call that retried one or more times "
+            "before succeeding counts here exactly once."
+        ),
+    )
+    failed: int = Field(
+        description=(
+            "Terminal failures: sum of calls in FAILED, NO_ANSWER, and BUSY states. "
+            "Retries that eventually succeeded do NOT count here."
+        ),
+    )
+    retries_attempted: int = Field(
+        description=(
+            "Number of retry attempts across all calls (attempt_epoch - 1 per call, "
+            "clamped at 0). A call that succeeded on its first dial contributes 0; "
+            "a call retried twice contributes 2."
+        ),
+    )
+    in_progress: int = Field(
+        description=(
+            "Calls not yet terminal from the caller's point of view — rows in "
+            "QUEUED, DIALING, IN_PROGRESS, or RETRY_PENDING. "
+            "completed + failed + in_progress == total."
+        ),
+    )
 
 
 __all__ = [
+    "CampaignCallResponse",
+    "CampaignCallsListResponse",
     "CampaignCreate",
     "CampaignListResponse",
     "CampaignResponse",

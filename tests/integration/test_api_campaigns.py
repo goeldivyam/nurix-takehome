@@ -126,7 +126,9 @@ class TestPostCampaign:
         assert resp.status_code == 201, resp.text
         data = resp.json()
         assert data["name"] == "nurix-demo"
-        assert data["status"] == "PENDING"
+        # External status vocabulary per assignment ("pending, in-progress,
+        # completed, failed"). Internal DB column remains `PENDING`.
+        assert data["status"] == "pending"
         assert data["timezone"] == "America/Los_Angeles"
         assert data["max_concurrent"] == deps.settings.max_concurrent_default
         assert data["retry_config"] == DEFAULT_RETRY_CONFIG
@@ -282,3 +284,106 @@ class TestGetStats:
     async def test_get_stats_404_missing(self, client: AsyncClient) -> None:
         resp = await client.get(f"/campaigns/{uuid4()}/stats")
         assert resp.status_code == 404, resp.text
+
+
+class TestGetCampaignCalls:
+    # `GET /campaigns/{id}/calls` powers the drill-in drawer that surfaces
+    # the per-call lifecycle. Contract: paginated with keyset cursor on
+    # (updated_at DESC, id DESC), returns INTERNAL call-status vocabulary
+    # (the drawer's raison d'etre is distinguishing QUEUED vs DIALING vs
+    # RETRY_PENDING), 404s on an unknown campaign.
+
+    async def test_returns_calls_in_updated_at_desc(self, client: AsyncClient) -> None:
+        body = _valid_campaign_body(phones=["+14155557001", "+14155557002", "+14155557003"])
+        created = await client.post("/campaigns", json=body)
+        campaign_id = created.json()["id"]
+
+        resp = await client.get(f"/campaigns/{campaign_id}/calls")
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert "calls" in payload
+        assert "next_cursor" in payload
+        assert len(payload["calls"]) == 3
+        # Shape: no provider_call_id (intentionally dropped — telephony
+        # vocabulary doesn't belong on the campaigns API).
+        first = payload["calls"][0]
+        assert set(first.keys()) == {
+            "id",
+            "phone",
+            "status",
+            "attempt_epoch",
+            "retries_remaining",
+            "next_attempt_at",
+            "updated_at",
+        }
+        # Status is internal vocabulary so the drawer can show QUEUED.
+        for call in payload["calls"]:
+            assert call["status"] == "QUEUED"
+            assert call["attempt_epoch"] == 0
+        # updated_at DESC: every row's updated_at >= the next row's.
+        updated_ats = [c["updated_at"] for c in payload["calls"]]
+        assert updated_ats == sorted(updated_ats, reverse=True)
+
+    async def test_404_on_unknown_campaign(self, client: AsyncClient) -> None:
+        resp = await client.get(f"/campaigns/{uuid4()}/calls")
+        assert resp.status_code == 404, resp.text
+
+    async def test_cursor_round_trip_pages_disjoint_and_cover_all(
+        self, client: AsyncClient
+    ) -> None:
+        # Seed 5 calls, page with limit=2 → two pages of 2, third page of 1.
+        # Cursor-paginated results must be strictly disjoint and their union
+        # must equal the full `limit=big` single-page result — that's the
+        # keyset contract we rely on in the drawer UI.
+        phones = [f"+1415555{7100 + i:04d}" for i in range(5)]
+        body = _valid_campaign_body(phones=phones)
+        created = await client.post("/campaigns", json=body)
+        campaign_id = created.json()["id"]
+
+        full = await client.get(f"/campaigns/{campaign_id}/calls", params={"limit": 10})
+        full_ids = {c["id"] for c in full.json()["calls"]}
+        assert len(full_ids) == 5
+
+        collected: set[str] = set()
+        cursor: str | None = None
+        pages = 0
+        while True:
+            params: dict[str, Any] = {"limit": 2}
+            if cursor:
+                params["cursor"] = cursor
+            resp = await client.get(f"/campaigns/{campaign_id}/calls", params=params)
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            pages += 1
+            page_ids = {c["id"] for c in data["calls"]}
+            # Strictly disjoint across pages — keyset must never repeat.
+            assert not (collected & page_ids), "keyset pagination returned duplicates"
+            collected.update(page_ids)
+            cursor = data["next_cursor"]
+            if cursor is None:
+                break
+            # Guard against an infinite loop if the cursor ever stops advancing.
+            assert pages < 10
+        assert collected == full_ids
+
+    async def test_empty_campaign_returns_empty_list(self, client: AsyncClient, deps: Deps) -> None:
+        # A campaign with zero calls (theoretical; not reachable through
+        # POST /campaigns because `phones` has min_length=1) still resolves
+        # cleanly through the endpoint rather than 500-ing. We insert
+        # directly via the repo to simulate the edge.
+        async with deps.pools.scheduler.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO campaigns (name, status, timezone, schedule,
+                    max_concurrent, retry_config)
+                VALUES ('empty', 'PENDING', 'UTC',
+                    '{"mon":[]}'::jsonb, 1, '{"max_attempts": 0,
+                    "backoff_base_seconds": 1}'::jsonb)
+                RETURNING id
+                """
+            )
+        empty_id = row["id"]
+        resp = await client.get(f"/campaigns/{empty_id}/calls")
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload == {"calls": [], "next_cursor": None}

@@ -106,6 +106,21 @@ def _decode_campaign_cursor(cursor: str) -> tuple[datetime, UUID]:
     return created_at, UUID(obj["id"])
 
 
+def _encode_call_cursor(updated_at: datetime, call_id: UUID) -> str:
+    # Per-campaign call-list cursor. `updated_at DESC` is the natural order
+    # for an operator watching a campaign — most-recently-moved calls land
+    # at the top. Cursor key mirrors the `(updated_at, id)` pair in the
+    # ORDER BY so keyset pagination is stable under concurrent updates.
+    payload = json.dumps({"updated_at": updated_at.isoformat(), "id": str(call_id)}).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_call_cursor(cursor: str) -> tuple[datetime, UUID]:
+    raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+    obj = json.loads(raw.decode("utf-8"))
+    return datetime.fromisoformat(obj["updated_at"]), UUID(obj["id"])
+
+
 # -- JSON decode helpers -----------------------------------------------------
 
 
@@ -240,6 +255,14 @@ class CampaignRepo:
     async def list_eligible_for_tick(
         conn: asyncpg.Connection,
     ) -> list[CampaignRowWithCursor]:
+        # `EXISTS (...)` narrows the set to campaigns with at least one live
+        # (non-terminal) call. Without this, a campaign whose calls have all
+        # finished but whose own rollup hasn't fired yet — or a PENDING
+        # campaign seeded with zero calls — would be returned every tick and
+        # emit noise (SKIP_BUSINESS_HOUR / SKIP_CONCURRENCY rows about nothing)
+        # into the audit log. A business-hour-closed campaign with QUEUED
+        # calls still appears (it has work), so its SKIP_BUSINESS_HOUR rows
+        # are preserved as actionable forensic evidence.
         rows = await conn.fetch(
             """
             SELECT c.id, c.name, c.status, c.timezone, c.schedule,
@@ -248,6 +271,11 @@ class CampaignRepo:
             FROM campaigns c
             LEFT JOIN scheduler_campaign_state s ON s.campaign_id = c.id
             WHERE c.status IN ('PENDING', 'ACTIVE')
+              AND EXISTS (
+                  SELECT 1 FROM calls
+                  WHERE campaign_id = c.id
+                    AND status IN ('QUEUED', 'DIALING', 'IN_PROGRESS', 'RETRY_PENDING')
+              )
             ORDER BY c.id ASC
             """
         )
@@ -327,6 +355,59 @@ class CampaignRepo:
 
 
 class CallRepo:
+    @staticmethod
+    async def list_for_campaign(
+        api_pool: asyncpg.Pool,
+        campaign_id: UUID,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[CallRow], str | None]:
+        # Powers the per-campaign drill-in drawer. Ordered by `updated_at
+        # DESC` so the most-recently-moved calls surface first — that's
+        # what an operator watching a live campaign wants to scan. Keyset
+        # pagination via `(updated_at, id)` matches the campaign list's
+        # discipline and stays stable under concurrent row updates.
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if cursor is None:
+            rows = await api_pool.fetch(
+                """
+                SELECT id, campaign_id, phone, status, attempt_epoch,
+                       retries_remaining, next_attempt_at, provider_call_id,
+                       created_at, updated_at
+                FROM calls
+                WHERE campaign_id = $1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT $2
+                """,
+                campaign_id,
+                limit,
+            )
+        else:
+            cursor_ts, cursor_id = _decode_call_cursor(cursor)
+            rows = await api_pool.fetch(
+                """
+                SELECT id, campaign_id, phone, status, attempt_epoch,
+                       retries_remaining, next_attempt_at, provider_call_id,
+                       created_at, updated_at
+                FROM calls
+                WHERE campaign_id = $1
+                  AND (updated_at, id) < ($2, $3)
+                ORDER BY updated_at DESC, id DESC
+                LIMIT $4
+                """,
+                campaign_id,
+                cursor_ts,
+                cursor_id,
+                limit,
+            )
+        result = [_call_row_from_record(r) for r in rows]
+        next_cursor: str | None = None
+        if len(result) == limit and result:
+            last = result[-1]
+            next_cursor = _encode_call_cursor(last.updated_at, last.id)
+        return result, next_cursor
+
     @staticmethod
     async def create_batch(
         conn: asyncpg.Connection,
