@@ -4,17 +4,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-# P1D owns `app.audit.emitter` and provides
-# `async def emit_audit(conn, event: AuditEvent) -> None`. If P1D hasn't
-# landed yet, importing this module will raise ImportError — that's intended:
-# the state machine must NEVER silently swallow a missing audit writer, since
-# the audit log IS the visualization per rubric #7.
 from app.audit.emitter import emit_audit
 from app.audit.events import AuditEvent, EventType
-from app.state.campaign_terminal import (
-    maybe_promote_to_active,
-    maybe_transition_campaign_terminal,
-)
+from app.state.campaign_terminal import maybe_transition_campaign_terminal
 from app.state.types import TERMINAL_CALL_STATUSES, CallStatus
 
 if TYPE_CHECKING:
@@ -34,16 +26,27 @@ class TransitionResult:
     # Return type for state.transition(). `applied=False` means the CAS
     # UPDATE matched zero rows (stale expected_status / expected_epoch) —
     # caller handles idempotently. `row` is a dict copy of the asyncpg Record
-    # for the freshly-updated row; None on no-op.
+    # for the freshly-updated row; None on no-op. `rejected_reason` is set
+    # when the transition was refused at the invariant-guard layer BEFORE
+    # hitting the DB — distinct from a stale CAS so callers can emit a more
+    # specific audit row (e.g. "terminal-wins" vs "CAS no-op").
     applied: bool
     row: dict[str, Any] | None
+    rejected_reason: str | None = None
 
     def is_no_op(self) -> bool:
         return not self.applied
 
+    def is_terminal_regression(self) -> bool:
+        return self.rejected_reason == "terminal_regression"
+
     @classmethod
     def no_op(cls) -> TransitionResult:
         return cls(applied=False, row=None)
+
+    @classmethod
+    def terminal_regression(cls) -> TransitionResult:
+        return cls(applied=False, row=None, rejected_reason="terminal_regression")
 
     @classmethod
     def applied_(cls, row: dict[str, Any]) -> TransitionResult:
@@ -84,6 +87,27 @@ async def transition(
 
     expected_status_str = _status_value(expected_status)
     new_status_str = _status_value(new_status)
+
+    # Terminal-is-absorbing invariant (the state machine is the sole mutator,
+    # so the invariant belongs here — not in any one caller). Once a call
+    # reaches a terminal status, no transition may move it anywhere else —
+    # not to a non-terminal (e.g. late IN_PROGRESS after COMPLETED) and not
+    # to a DIFFERENT terminal (e.g. contradictory FAILED webhook arriving
+    # after a legitimate COMPLETED landed). Both edges are race artefacts of
+    # at-least-once + out-of-order webhook delivery; terminal always wins
+    # the first time it's applied, and the audit log preserves the losing
+    # event forensically via a distinct `terminal-wins` reason.
+    #
+    # Reject BEFORE the DB write so callers get a distinct `rejected_reason`
+    # they can audit differently from a plain stale CAS. The webhook
+    # processor relies on this; internal callers (scheduler tick, reclaim,
+    # retry_apply) never construct such an edge by design, so this guard is
+    # defense-in-depth for them. `expected == new` (a trivial same-state
+    # update) is allowed through to the CAS because the same-state case is
+    # already filtered by the webhook adapter and never arises internally.
+    _terminal_values = {s.value for s in TERMINAL_CALL_STATUSES}
+    if expected_status_str in _terminal_values and new_status_str != expected_status_str:
+        return TransitionResult.terminal_regression()
 
     # Build the SET clause. `attempt_epoch` policy:
     #   - new_epoch is None  -> preserve current epoch (most transitions).
@@ -137,12 +161,11 @@ async def transition(
         ),
     )
 
-    # Campaign-level side-effects. Only fire when the status actually moves —
-    # a same-status column update (e.g. DIALING->DIALING writing
-    # provider_call_id) should not re-trigger promotion.
-    if new_status_str != expected_status_str and new_status_str == CallStatus.DIALING.value:
-        await maybe_promote_to_active(conn, row_dict["campaign_id"])
-
+    # Campaign-level rollup side-effect. PENDING → ACTIVE promotion is NOT
+    # driven from here: the sole QUEUED→DIALING path runs through
+    # `CallRepo.claim_next_queued` (a raw UPDATE, not `state.transition`), so
+    # the scheduler's Phase 1 explicitly calls `maybe_promote_to_active` on
+    # the same txn. Adding a promote hook here would be dead code today.
     if new_status_str in {s.value for s in TERMINAL_CALL_STATUSES}:
         await maybe_transition_campaign_terminal(conn, row_dict["campaign_id"])
 

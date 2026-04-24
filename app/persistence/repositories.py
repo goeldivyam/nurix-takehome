@@ -9,8 +9,6 @@ from uuid import UUID
 
 import asyncpg
 
-from app.audit.events import AuditEvent
-
 # -- Row types ---------------------------------------------------------------
 
 
@@ -64,17 +62,8 @@ class CallRow:
     updated_at: datetime
 
 
-@dataclass(frozen=True, slots=True)
-class AuditRow:
-    id: int
-    ts: datetime
-    event_type: str
-    campaign_id: UUID | None
-    call_id: UUID | None
-    reason: str
-    state_before: str | None
-    state_after: str | None
-    extra: dict[str, Any]
+# `AuditRow` lives in `app/audit/reader.py` — it's the return shape of
+# `query_audit`, the single audit-read surface. Defined there, not here.
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,20 +86,10 @@ class TerminalAggregate:
 
 
 # -- Cursor helpers ----------------------------------------------------------
-
-AUDIT_LIST_MAX_LIMIT = 500
-
-
-def _encode_audit_cursor(ts: datetime, row_id: int) -> str:
-    payload = json.dumps({"ts": ts.isoformat(), "id": row_id}).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii")
-
-
-def _decode_audit_cursor(cursor: str) -> tuple[datetime, int]:
-    raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
-    obj = json.loads(raw.decode("utf-8"))
-    ts = datetime.fromisoformat(obj["ts"])
-    return ts, int(obj["id"])
+#
+# Audit cursor helpers live in `app/audit/reader.py` alongside `query_audit`.
+# This module owns the campaign-list cursor (below) because `list_page` owns
+# the query it serializes from.
 
 
 def _encode_campaign_cursor(created_at: datetime, campaign_id: UUID) -> str:
@@ -290,19 +269,21 @@ class CampaignRepo:
 
     @staticmethod
     async def stats(api_pool: asyncpg.Pool, campaign_id: UUID) -> CampaignStats:
-        # Single aggregate pass. `retries_attempted` sums attempt_epoch across
-        # every call row — each row's epoch counts the total attempts made for
-        # that row, including the initial dial. `failed` aggregates every
-        # terminal non-success (FAILED + NO_ANSWER + BUSY) so it matches the
-        # external status mapping exposed by /calls/{id} — completed + failed
-        # + in_progress always sum to total.
+        # Single aggregate pass. `retries_attempted` is the number of RETRIES
+        # across all calls — NOT the total attempt count. A call that succeeded
+        # on its first dial has attempt_epoch=1 and contributes 0 retries;
+        # a call that was retried twice has attempt_epoch=3 and contributes 2.
+        # This matches the assignment's distinct metric ("calls completed,
+        # calls failed, and retries attempted") and the external /calls/{id}
+        # contract. `failed` aggregates every terminal non-success (FAILED +
+        # NO_ANSWER + BUSY) so completed + failed + in_progress == total.
         row = await api_pool.fetchrow(
             """
             SELECT
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
                 COUNT(*) FILTER (WHERE status IN ('FAILED', 'NO_ANSWER', 'BUSY')) AS failed,
-                COALESCE(SUM(attempt_epoch), 0) AS retries_attempted,
+                COALESCE(SUM(GREATEST(attempt_epoch - 1, 0)), 0) AS retries_attempted,
                 COUNT(*) FILTER (
                     WHERE status IN ('QUEUED', 'DIALING', 'IN_PROGRESS', 'RETRY_PENDING')
                 ) AS in_progress
@@ -381,6 +362,20 @@ class CallRepo:
         # makes concurrent claimers get different rows instead of serializing.
         # attempt_epoch is bumped here so the idempotency key the caller hands
         # to the provider is unique per dial attempt.
+        #
+        # `provider_call_id = NULL` is written in the SAME UPDATE as the epoch
+        # bump. On a retry-driven claim (RETRY_PENDING → QUEUED → DIALING) the
+        # row still carries the previous attempt's `provider_call_id`; without
+        # nulling it, a late webhook from that dead attempt would resolve back
+        # to this row via `CallRepo.get_by_provider_call_id` in the window
+        # between claim commit and the caller's subsequent `place_call`
+        # writing a fresh provider_call_id. The webhook processor's CAS
+        # guards on (status, attempt_epoch) only, and both now match the
+        # NEW attempt — the wrong attempt's webhook would silently apply.
+        # Nulling closes the correlation path; the forensic trail for the
+        # dead attempt's provider_call_id lives in the preceding audit rows
+        # (DISPATCH, RECLAIM_EXECUTED, or the FAILED/NO_ANSWER/BUSY
+        # TRANSITION row that preceded the RETRY_PENDING).
         row = await conn.fetchrow(
             """
             WITH candidate AS (
@@ -396,6 +391,7 @@ class CallRepo:
             UPDATE calls
             SET status = 'DIALING',
                 attempt_epoch = calls.attempt_epoch + 1,
+                provider_call_id = NULL,
                 updated_at = NOW()
             FROM candidate
             WHERE calls.id = candidate.id
@@ -571,100 +567,8 @@ def _call_row_from_record(row: asyncpg.Record) -> CallRow:
 # -- AuditRepo ---------------------------------------------------------------
 
 
-class AuditRepo:
-    @staticmethod
-    async def emit(conn: asyncpg.Connection, event: AuditEvent) -> None:
-        await conn.execute(
-            """
-            INSERT INTO scheduler_audit
-                (event_type, campaign_id, call_id, reason,
-                 state_before, state_after, extra)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-            """,
-            event.event_type,
-            event.campaign_id,
-            event.call_id,
-            event.reason,
-            event.state_before,
-            event.state_after,
-            _dumps_json(event.extra),
-        )
-
-    @staticmethod
-    async def list(
-        api_pool: asyncpg.Pool,
-        *,
-        campaign_id: UUID | None = None,
-        event_type: str | list[str] | None = None,
-        from_ts: datetime | None = None,
-        to_ts: datetime | None = None,
-        reason_contains: str | None = None,
-        cursor: str | None = None,
-        limit: int = 100,
-    ) -> tuple[list[AuditRow], str | None]:
-        if limit <= 0:
-            raise ValueError("limit must be positive")
-        if limit > AUDIT_LIST_MAX_LIMIT:
-            raise ValueError(f"limit must be <= {AUDIT_LIST_MAX_LIMIT}")
-
-        clauses: list[str] = []
-        args: list[Any] = []
-
-        def bind(value: Any) -> str:
-            args.append(value)
-            return f"${len(args)}"
-
-        if campaign_id is not None:
-            clauses.append(f"campaign_id = {bind(campaign_id)}")
-        if event_type is not None:
-            if isinstance(event_type, list):
-                clauses.append(f"event_type = ANY({bind(event_type)}::text[])")
-            else:
-                clauses.append(f"event_type = {bind(event_type)}")
-        if from_ts is not None:
-            clauses.append(f"ts >= {bind(from_ts)}")
-        if to_ts is not None:
-            clauses.append(f"ts <= {bind(to_ts)}")
-        if reason_contains is not None:
-            # ILIKE wildcards — escape % and _ in caller input, then wrap.
-            escaped = reason_contains.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            clauses.append(f"reason ILIKE {bind(f'%{escaped}%')}")
-        if cursor is not None:
-            cursor_ts, cursor_id = _decode_audit_cursor(cursor)
-            clauses.append(f"(ts, id) < ({bind(cursor_ts)}, {bind(cursor_id)})")
-
-        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit_placeholder = bind(limit)
-
-        # Clauses built from static fragments with only `$N` placeholders —
-        # every user value travels via args.
-        sql = (
-            "SELECT id, ts, event_type, campaign_id, call_id, reason, "  # noqa: S608
-            "state_before, state_after, extra "
-            f"FROM scheduler_audit {where_sql} "
-            f"ORDER BY ts DESC, id DESC LIMIT {limit_placeholder}"
-        )
-
-        rows = await api_pool.fetch(sql, *args)
-        result = [
-            AuditRow(
-                id=r["id"],
-                ts=r["ts"],
-                event_type=r["event_type"],
-                campaign_id=r["campaign_id"],
-                call_id=r["call_id"],
-                reason=r["reason"],
-                state_before=r["state_before"],
-                state_after=r["state_after"],
-                extra=_loads_json(r["extra"]),
-            )
-            for r in rows
-        ]
-        next_cursor: str | None = None
-        if len(result) == limit and result:
-            last = result[-1]
-            next_cursor = _encode_audit_cursor(last.ts, last.id)
-        return result, next_cursor
+# AuditRepo deleted — audit I/O lives exclusively in `app/audit/` now
+# (`emit_audit` for writes, `query_audit` for reads). One contract owner.
 
 
 # -- WebhookInboxRepo --------------------------------------------------------

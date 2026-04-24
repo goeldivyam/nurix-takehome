@@ -148,6 +148,21 @@ async def _apply_reclaim(deps: Deps, row: CallRow) -> ReclaimOutcome:
     # Unknown provider state (null handle, timeout, or non-terminal report).
     # Bump the epoch and return the row to QUEUED so a subsequent claim
     # produces a fresh idempotency key at the provider boundary.
+    #
+    # Clear `provider_call_id` in the SAME txn as the epoch bump so a late
+    # webhook from the dead attempt cannot resolve back to this row via
+    # `CallRepo.get_by_provider_call_id` and race-apply against the NEW
+    # epoch — `provider_call_id = $old` would match a reclaimed-then-redialed
+    # row whose epoch has since advanced, and the CAS in state.transition
+    # only guards on (status, attempt_epoch). The next claim writes a fresh
+    # provider_call_id when the redial lands.
+    #
+    # Forensic trail is preserved in the RECLAIM_EXECUTED audit row: the
+    # dead attempt's provider_call_id is captured in `extra.provider_call_id`
+    # below, so a provider-side investigation ("which of your call_ids was
+    # the one that stuck?") can still be answered off the audit log alone.
+    # The column is a live pointer to the current attempt; the audit table
+    # carries the per-attempt history.
     async with deps.pools.scheduler.acquire() as conn, conn.transaction():
         result = await state.transition(
             conn,
@@ -162,6 +177,7 @@ async def _apply_reclaim(deps: Deps, row: CallRow) -> ReclaimOutcome:
                 "previous_epoch": row.attempt_epoch,
                 "provider_call_id": row.provider_call_id,
             },
+            column_updates={"provider_call_id": None},
         )
     if result.is_no_op():
         return ReclaimOutcome(call_id=row.id, kind=ReclaimKind.SKIPPED_NO_OP)

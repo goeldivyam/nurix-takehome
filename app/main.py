@@ -146,15 +146,9 @@ async def health() -> dict[str, Any]:
 
 
 # Debug endpoints (age-dialing, etc.) are gated behind a setting so they
-# never ship to production by accident. P4 owns the router body.
-_settings_for_flags = Settings()
-if _settings_for_flags.debug_endpoints_enabled:
-    try:
-        from app.api.routers import debug as _debug_module  # type: ignore[attr-defined]
+# never ship to production by accident. The router is included only when
+# DEBUG_ENDPOINTS_ENABLED=true; the handler itself also re-checks the flag.
+if Settings().debug_endpoints_enabled:
+    from app.api.routers.debug import router as debug_router
 
-        app.include_router(_debug_module.router)
-    except ImportError:
-        # P4 lands the debug router module. Until then, the flag can be
-        # on without the import existing — fail-open rather than crash
-        # startup.
-        logger.info("DEBUG_ENDPOINTS_ENABLED=true but debug router not yet present")
+    app.include_router(debug_router)

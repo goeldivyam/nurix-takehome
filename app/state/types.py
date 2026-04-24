@@ -27,16 +27,7 @@ class CampaignStatus(str, Enum):
 TERMINAL_CALL_STATUSES: frozenset[CallStatus] = frozenset(
     {CallStatus.COMPLETED, CallStatus.FAILED, CallStatus.NO_ANSWER, CallStatus.BUSY}
 )
-
-NON_TERMINAL_CALL_STATUSES: frozenset[CallStatus] = frozenset(
-    {
-        CallStatus.QUEUED,
-        CallStatus.DIALING,
-        CallStatus.IN_PROGRESS,
-        CallStatus.RETRY_PENDING,
-    }
-)
-
-IN_FLIGHT_CALL_STATUSES: frozenset[CallStatus] = frozenset(
-    {CallStatus.DIALING, CallStatus.IN_PROGRESS}
-)
+# The non-terminal and in-flight sets were once declared here for symmetry;
+# every call site elected to spell the SQL literal list inline for query
+# readability, so the constants were dead weight. Keep only the terminal set
+# (imported by `state.machine` to fire the rollup hook).

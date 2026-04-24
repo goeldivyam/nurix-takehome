@@ -3,9 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-# P1D owns `app.audit.emitter`. Same rationale as machine.py: if the module
-# hasn't landed yet, ImportError surfaces immediately rather than silently
-# dropping CAMPAIGN_PROMOTED_ACTIVE / CAMPAIGN_COMPLETED audit rows.
 from app.audit.emitter import emit_audit
 from app.audit.events import AuditEvent
 
@@ -44,9 +41,28 @@ async def maybe_promote_to_active(conn: asyncpg.Connection, campaign_id: UUID) -
 async def maybe_transition_campaign_terminal(conn: asyncpg.Connection, campaign_id: UUID) -> None:
     # Called from state.transition() after every terminal call transition.
     # If the campaign has no more in-flight / queued / retry-pending work,
-    # fold it to its own terminal state. CAS on status='ACTIVE' naturally
-    # serializes the race when the last two calls terminate simultaneously:
-    # whichever connection commits first wins; the second sees a no-op.
+    # fold it to its own terminal state.
+    #
+    # `SELECT ... FOR NO KEY UPDATE` serializes concurrent rollup attempts
+    # on the same campaign row. Under READ COMMITTED, two concurrent
+    # terminal transactions on the last two calls could otherwise each read
+    # the OTHER call as still active (each other's UPDATE not yet committed),
+    # both skip the rollup, and the campaign is stranded ACTIVE with zero
+    # active calls. The status='ACTIVE' CAS on the final UPDATE only guards
+    # against DOUBLE rollup, not against ZERO rollup. Taking the row-level
+    # lock here forces the second transaction to wait, so when its SELECT
+    # COUNT runs it sees the first txn's committed calls UPDATE and proceeds
+    # with the rollup itself.
+    #
+    # `FOR NO KEY UPDATE` (not plain `FOR UPDATE`) is the right variant:
+    # the CAS below updates only non-key columns (status, updated_at), and
+    # the weaker lock doesn't block concurrent INSERTs on FK-referencing
+    # tables (calls, scheduler_audit) — important because the caller's
+    # transaction is simultaneously inserting an audit row. Lock ordering
+    # from the caller's side is always `calls` row (already UPDATEd by the
+    # terminal transition) then `campaigns` row here — consistent across
+    # all callers, so no deadlock opportunity.
+    await conn.execute("SELECT 1 FROM campaigns WHERE id = $1 FOR NO KEY UPDATE", campaign_id)
     active = await conn.fetchval(
         """
         SELECT COUNT(*) FROM calls

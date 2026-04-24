@@ -140,6 +140,10 @@ class TestReclaimOneInner:
         assert kwargs["expected_epoch"] == 3
         assert kwargs["new_epoch"] == 4
         assert kwargs["event_type"] == "RECLAIM_EXECUTED"
+        # `provider_call_id=None` is load-bearing: without it, a late webhook
+        # from the dead attempt could resolve back to this row via
+        # `CallRepo.get_by_provider_call_id` and race-CAS the new epoch.
+        assert kwargs["column_updates"] == {"provider_call_id": None}
         assert outcome.kind is ReclaimKind.EXECUTED
 
     async def test_provider_terminal_applies_same_epoch(
@@ -197,6 +201,7 @@ class TestReclaimOneInner:
         assert kwargs["new_status"] is CallStatus.QUEUED
         assert kwargs["new_epoch"] == 2
         assert kwargs["event_type"] == "RECLAIM_EXECUTED"
+        assert kwargs["column_updates"] == {"provider_call_id": None}
         assert outcome.kind is ReclaimKind.EXECUTED
 
     async def test_provider_get_status_raises_falls_through_to_reclaim(

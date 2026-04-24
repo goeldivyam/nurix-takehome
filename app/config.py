@@ -50,16 +50,33 @@ class Settings(BaseSettings):
         # CAS, so a wider-than-strict window is safe.
         return self.max_call_duration_seconds + 30
 
+    # DEMO_MODE overrides — calibrated so a reviewer can witness each rubric
+    # scenario inside a 10-minute demo window:
+    #   * 15s call duration — long enough that the DIALING slice comfortably
+    #     spans age-dialing + reclaim-sweep (5s) without racing to IN_PROGRESS
+    #     before the age POST lands.
+    #   * 35% retryable failure rate — produces a few retries on 10-20 phones
+    #     without making every call look broken.
+    #   * 5s reclaim interval — RECLAIM_EXECUTED appears within seconds of
+    #     /debug/age-dialing rather than 30s of dead air on the default cadence.
+    _DEMO_CALL_DURATION_SECONDS: float = 15.0
+    _DEMO_FAILURE_RATE: float = 0.35
+    _DEMO_RECLAIM_SWEEP_INTERVAL_SECONDS: float = 5.0
+
     @property
     def mock_call_duration_effective(self) -> float:
-        return 8.0 if self.demo_mode else self.mock_call_duration_seconds
+        return (
+            self._DEMO_CALL_DURATION_SECONDS if self.demo_mode else self.mock_call_duration_seconds
+        )
 
     @property
     def mock_failure_rate_effective(self) -> float:
-        return 0.35 if self.demo_mode else self.mock_failure_rate
+        return self._DEMO_FAILURE_RATE if self.demo_mode else self.mock_failure_rate
 
     @property
     def reclaim_sweep_interval_effective(self) -> float:
-        # Demo overrides the default 30s so RECLAIM_EXECUTED lands inside the
-        # live demo window instead of behind 30s of dead air.
-        return 5.0 if self.demo_mode else self.reclaim_sweep_interval_seconds
+        return (
+            self._DEMO_RECLAIM_SWEEP_INTERVAL_SECONDS
+            if self.demo_mode
+            else self.reclaim_sweep_interval_seconds
+        )

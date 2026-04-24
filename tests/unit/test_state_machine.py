@@ -71,6 +71,90 @@ class TestTransitionResult:
         assert r.row == row
         assert r.is_no_op() is False
 
+    def test_terminal_regression(self) -> None:
+        r = TransitionResult.terminal_regression()
+        assert r.applied is False
+        assert r.row is None
+        assert r.is_no_op() is True
+        assert r.is_terminal_regression() is True
+
+    def test_plain_no_op_is_not_terminal_regression(self) -> None:
+        # Discriminator must distinguish the two no-op shapes: plain CAS miss
+        # has no rejected_reason; terminal-regression sets it.
+        assert TransitionResult.no_op().is_terminal_regression() is False
+
+
+class TestTerminalAbsorbingInvariant:
+    # The "terminal is absorbing" invariant lives in state.transition so the
+    # state machine (sole mutator) rejects ANY edge out of a terminal status.
+    # This protects against a future driver (cancel API, second provider
+    # adapter, test harness) that might otherwise race-CAS a terminal row
+    # back to an intermediate one AND against the webhook-ordering race
+    # where a contradictory late terminal event (e.g. FAILED after a
+    # legitimate COMPLETED landed) would otherwise corrupt the row.
+
+    @pytest.mark.parametrize(
+        ("expected", "new"),
+        [
+            # terminal → non-terminal: the obvious regression (late
+            # intermediate webhook after terminal).
+            (CallStatus.COMPLETED, CallStatus.IN_PROGRESS),
+            (CallStatus.FAILED, CallStatus.DIALING),
+            (CallStatus.NO_ANSWER, CallStatus.QUEUED),
+            (CallStatus.BUSY, CallStatus.RETRY_PENDING),
+            # terminal → DIFFERENT terminal: the subtler race (a
+            # contradictory late terminal webhook after the row already
+            # landed on a different terminal). Terminal is absorbing — the
+            # first winner stays; the second lands as terminal-wins.
+            (CallStatus.COMPLETED, CallStatus.FAILED),
+            (CallStatus.FAILED, CallStatus.COMPLETED),
+            (CallStatus.NO_ANSWER, CallStatus.FAILED),
+            (CallStatus.BUSY, CallStatus.COMPLETED),
+        ],
+    )
+    async def test_any_edge_out_of_terminal_is_rejected_before_db(
+        self, expected: CallStatus, new: CallStatus
+    ) -> None:
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock()
+        conn.execute = AsyncMock()
+
+        result = await transition(
+            conn,
+            call_id=uuid4(),
+            expected_status=expected,
+            new_status=new,
+            expected_epoch=1,
+            event_type="TRANSITION",
+            reason="test",
+        )
+
+        assert result.is_no_op() is True
+        assert result.is_terminal_regression() is True
+        # Invariant is enforced BEFORE the DB write — no SQL issued.
+        conn.fetchrow.assert_not_called()
+
+    async def test_terminal_same_state_is_permitted(self) -> None:
+        # `expected == new` (a trivial same-state update) passes through to
+        # the CAS. In practice the webhook adapter's same-state filter
+        # catches this earlier and internal callers never construct it, but
+        # the invariant should not block a legitimate no-op request.
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=None)
+
+        result = await transition(
+            conn,
+            call_id=uuid4(),
+            expected_status=CallStatus.COMPLETED,
+            new_status=CallStatus.COMPLETED,
+            expected_epoch=1,
+            event_type="TRANSITION",
+            reason="test",
+        )
+
+        assert result.is_terminal_regression() is False
+        conn.fetchrow.assert_awaited()
+
 
 class TestTransitionColumnUpdateGuard:
     # Guard on the allow-list runs BEFORE any DB work. Using AsyncMock lets us
@@ -126,11 +210,6 @@ class TestTransitionColumnUpdateGuard:
         monkeypatch.setattr(state_machine, "emit_audit", fake_emit)
         monkeypatch.setattr(
             state_machine,
-            "maybe_promote_to_active",
-            AsyncMock(return_value=None),
-        )
-        monkeypatch.setattr(
-            state_machine,
             "maybe_transition_campaign_terminal",
             AsyncMock(return_value=None),
         )
@@ -171,10 +250,8 @@ class TestTransitionBehavior:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         emit_mock = AsyncMock()
-        promote_mock = AsyncMock()
         terminal_mock = AsyncMock()
         monkeypatch.setattr(state_machine, "emit_audit", emit_mock)
-        monkeypatch.setattr(state_machine, "maybe_promote_to_active", promote_mock)
         monkeypatch.setattr(state_machine, "maybe_transition_campaign_terminal", terminal_mock)
 
         conn = MagicMock()
@@ -192,17 +269,14 @@ class TestTransitionBehavior:
 
         assert result.is_no_op()
         emit_mock.assert_not_awaited()
-        promote_mock.assert_not_awaited()
         terminal_mock.assert_not_awaited()
 
     async def test_terminal_status_triggers_campaign_rollup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         emit_mock = AsyncMock()
-        promote_mock = AsyncMock()
         terminal_mock = AsyncMock()
         monkeypatch.setattr(state_machine, "emit_audit", emit_mock)
-        monkeypatch.setattr(state_machine, "maybe_promote_to_active", promote_mock)
         monkeypatch.setattr(state_machine, "maybe_transition_campaign_terminal", terminal_mock)
 
         campaign_id = uuid4()
@@ -228,17 +302,16 @@ class TestTransitionBehavior:
         )
 
         emit_mock.assert_awaited_once()
-        promote_mock.assert_not_awaited()
         terminal_mock.assert_awaited_once_with(conn, campaign_id)
 
-    async def test_queued_to_dialing_triggers_promote_not_rollup(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_queued_to_dialing_does_not_rollup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # state.transition no longer drives PENDING → ACTIVE promotion —
+        # that's the tick's Phase 1 responsibility because the claim
+        # primitive (raw UPDATE) is the only real QUEUED→DIALING caller.
+        # We only assert the rollup hook does NOT fire on a non-terminal.
         emit_mock = AsyncMock()
-        promote_mock = AsyncMock()
         terminal_mock = AsyncMock()
         monkeypatch.setattr(state_machine, "emit_audit", emit_mock)
-        monkeypatch.setattr(state_machine, "maybe_promote_to_active", promote_mock)
         monkeypatch.setattr(state_machine, "maybe_transition_campaign_terminal", terminal_mock)
 
         campaign_id = uuid4()
@@ -264,19 +337,18 @@ class TestTransitionBehavior:
             reason="claim",
         )
 
-        promote_mock.assert_awaited_once_with(conn, campaign_id)
+        emit_mock.assert_awaited_once()
         terminal_mock.assert_not_awaited()
 
-    async def test_same_status_update_does_not_trigger_promote(
+    async def test_same_status_update_does_not_trigger_rollup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # DIALING -> DIALING (recording provider_call_id) must not re-fire
-        # maybe_promote_to_active — that would emit a spurious audit row.
+        # DIALING -> DIALING (recording provider_call_id) is an
+        # assertion-preserving update — still emits audit, still must NOT
+        # trigger terminal rollup (the status isn't terminal).
         emit_mock = AsyncMock()
-        promote_mock = AsyncMock()
         terminal_mock = AsyncMock()
         monkeypatch.setattr(state_machine, "emit_audit", emit_mock)
-        monkeypatch.setattr(state_machine, "maybe_promote_to_active", promote_mock)
         monkeypatch.setattr(state_machine, "maybe_transition_campaign_terminal", terminal_mock)
 
         campaign_id = uuid4()
@@ -304,13 +376,11 @@ class TestTransitionBehavior:
         )
 
         emit_mock.assert_awaited_once()
-        promote_mock.assert_not_awaited()
         terminal_mock.assert_not_awaited()
 
     async def test_status_can_be_str_or_enum(self, monkeypatch: pytest.MonkeyPatch) -> None:
         emit_mock = AsyncMock()
         monkeypatch.setattr(state_machine, "emit_audit", emit_mock)
-        monkeypatch.setattr(state_machine, "maybe_promote_to_active", AsyncMock(return_value=None))
         monkeypatch.setattr(
             state_machine,
             "maybe_transition_campaign_terminal",

@@ -42,6 +42,12 @@ class _FakeConn:
     def transaction(self) -> _FakeTransactionContext:
         return _FakeTransactionContext()
 
+    async def fetchrow(self, query: str, *args: object) -> dict[str, object] | None:
+        # Tests that exercise the terminal-webhook path mock
+        # `wp.CampaignRepo.get` directly; this stub is only a fallback in case
+        # some future test exercises a code path that still queries directly.
+        return None
+
 
 class _FakePool:
     def __init__(self, conn: _FakeConn | None = None) -> None:
@@ -107,6 +113,7 @@ def _make_deps(
     settings = SimpleNamespace(
         webhook_processor_batch_max=batch_max,
         scheduler_safety_net_seconds=1.0,
+        retry_backoff_base_seconds=30,
     )
     pools = SimpleNamespace(scheduler=_FakePool())
     wake = SimpleNamespace(notify=MagicMock())
@@ -179,9 +186,10 @@ class TestProcessOneRow:
     async def test_stale_cas_emits_second_stale_audit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # CAS mismatch path: the state machine returns is_no_op()=True, we
-        # must persist a stale-audit row with expected_status + expected_epoch
-        # in `extra` so forensic queries can reconstruct the race.
+        # CAS mismatch path for a terminal webhook: apply_retryable_outcome
+        # returns is_no_op()=True and we must persist a stale-audit row with
+        # expected_status + expected_epoch in `extra` so forensic queries can
+        # reconstruct the race.
         inbox = _inbox_row(payload={"provider_call_id": "pc-1", "status": "COMPLETED"})
         call = _call_row(status="QUEUED", attempt_epoch=5, provider_call_id="pc-1")
 
@@ -189,12 +197,18 @@ class TestProcessOneRow:
             wp.WebhookInboxRepo, "claim_unprocessed_one", AsyncMock(return_value=inbox)
         )
         monkeypatch.setattr(wp.CallRepo, "get_by_provider_call_id", AsyncMock(return_value=call))
+        monkeypatch.setattr(wp.CampaignRepo, "get", AsyncMock(return_value=None))
         mark_mock = AsyncMock()
         monkeypatch.setattr(wp.WebhookInboxRepo, "mark_processed", mark_mock)
         emit_mock = AsyncMock()
         monkeypatch.setattr(wp, "emit_audit", emit_mock)
-        transition_mock = AsyncMock(return_value=SimpleNamespace(is_no_op=lambda: True))
-        monkeypatch.setattr(wp.state, "transition", transition_mock)
+        apply_mock = AsyncMock(
+            return_value=SimpleNamespace(
+                is_no_op=lambda: True,
+                is_terminal_regression=lambda: False,
+            )
+        )
+        monkeypatch.setattr(wp, "apply_retryable_outcome", apply_mock)
 
         parse_fn = MagicMock(
             return_value=ProviderEvent(
@@ -208,7 +222,7 @@ class TestProcessOneRow:
         outcome = await _process_one_row(deps)
 
         assert outcome == "stale"
-        transition_mock.assert_awaited_once()
+        apply_mock.assert_awaited_once()
         emit_mock.assert_awaited_once()
         emitted = emit_mock.await_args.args[1]
         assert emitted.event_type == "WEBHOOK_IGNORED_STALE"
@@ -219,6 +233,62 @@ class TestProcessOneRow:
         assert emitted.extra["expected_epoch"] == 5
         assert emitted.extra["event_status"] == "COMPLETED"
         assert emitted.extra["provider_event_id"] == "evt-1"
+        mark_mock.assert_awaited_once()
+
+    async def test_terminal_regression_emits_terminal_wins_audit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Provider re-fires an IN_PROGRESS webhook after the row has already
+        # reached a terminal status. The state machine rejects the edge via
+        # its terminal-is-absorbing invariant (TransitionResult.terminal_regression()),
+        # and the webhook processor must record a `terminal-wins` forensic
+        # row — distinct from the generic "CAS no-op" reason — so the race
+        # is answerable off the audit log alone.
+        inbox = _inbox_row(payload={"provider_call_id": "pc-1", "status": "IN_PROGRESS"})
+        call = _call_row(status="COMPLETED", attempt_epoch=2, provider_call_id="pc-1")
+
+        monkeypatch.setattr(
+            wp.WebhookInboxRepo, "claim_unprocessed_one", AsyncMock(return_value=inbox)
+        )
+        monkeypatch.setattr(wp.CallRepo, "get_by_provider_call_id", AsyncMock(return_value=call))
+        mark_mock = AsyncMock()
+        monkeypatch.setattr(wp.WebhookInboxRepo, "mark_processed", mark_mock)
+        emit_mock = AsyncMock()
+        monkeypatch.setattr(wp, "emit_audit", emit_mock)
+        transition_mock = AsyncMock(
+            return_value=SimpleNamespace(
+                is_no_op=lambda: True,
+                is_terminal_regression=lambda: True,
+            )
+        )
+        monkeypatch.setattr(wp.state, "transition", transition_mock)
+
+        parse_fn = MagicMock(
+            return_value=ProviderEvent(
+                provider_event_id="evt-tw",
+                provider_call_id="pc-1",
+                status_enum=CallStatus.IN_PROGRESS,
+            )
+        )
+        deps = _make_deps(parse_event_fn=parse_fn)
+
+        outcome = await _process_one_row(deps)
+
+        assert outcome == "stale"
+        transition_mock.assert_awaited_once()
+        emit_mock.assert_awaited_once()
+        emitted = emit_mock.await_args.args[1]
+        assert emitted.event_type == "WEBHOOK_IGNORED_STALE"
+        assert emitted.call_id == call.id
+        assert emitted.campaign_id == call.campaign_id
+        assert emitted.reason.startswith("terminal-wins:")
+        assert emitted.extra["current_status"] == "COMPLETED"
+        assert emitted.extra["event_status"] == "IN_PROGRESS"
+        assert emitted.extra["provider_event_id"] == "evt-tw"
+        # No CAS-no-op keys on the terminal-regression branch — the extra
+        # carries the terminal-wins shape, not the stale-CAS shape.
+        assert "expected_status" not in emitted.extra
+        assert "expected_epoch" not in emitted.extra
         mark_mock.assert_awaited_once()
 
     async def test_applied_transition_marks_processed_and_returns_applied(
@@ -235,7 +305,12 @@ class TestProcessOneRow:
         monkeypatch.setattr(wp.WebhookInboxRepo, "mark_processed", mark_mock)
         emit_mock = AsyncMock()
         monkeypatch.setattr(wp, "emit_audit", emit_mock)
-        transition_mock = AsyncMock(return_value=SimpleNamespace(is_no_op=lambda: False))
+        transition_mock = AsyncMock(
+            return_value=SimpleNamespace(
+                is_no_op=lambda: False,
+                is_terminal_regression=lambda: False,
+            )
+        )
         monkeypatch.setattr(wp.state, "transition", transition_mock)
 
         parse_fn = MagicMock(
@@ -264,9 +339,10 @@ class TestProcessOneRow:
     async def test_transition_error_returns_error_and_rolls_back(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # If state.transition raises, the txn rolls back and the inbox row
-        # stays unclaimed for the next drain. The outcome is "error" so the
-        # caller doesn't mistakenly count it as processed.
+        # If apply_retryable_outcome raises on a terminal webhook, the txn
+        # rolls back and the inbox row stays unclaimed for the next drain.
+        # The outcome is "error" so the caller doesn't mistakenly count it
+        # as processed.
         inbox = _inbox_row(payload={"provider_call_id": "pc-1", "status": "COMPLETED"})
         call = _call_row(status="DIALING", attempt_epoch=1, provider_call_id="pc-1")
 
@@ -274,12 +350,13 @@ class TestProcessOneRow:
             wp.WebhookInboxRepo, "claim_unprocessed_one", AsyncMock(return_value=inbox)
         )
         monkeypatch.setattr(wp.CallRepo, "get_by_provider_call_id", AsyncMock(return_value=call))
+        monkeypatch.setattr(wp.CampaignRepo, "get", AsyncMock(return_value=None))
         mark_mock = AsyncMock()
         monkeypatch.setattr(wp.WebhookInboxRepo, "mark_processed", mark_mock)
         emit_mock = AsyncMock()
         monkeypatch.setattr(wp, "emit_audit", emit_mock)
-        transition_mock = AsyncMock(side_effect=RuntimeError("db exploded"))
-        monkeypatch.setattr(wp.state, "transition", transition_mock)
+        apply_mock = AsyncMock(side_effect=RuntimeError("db exploded"))
+        monkeypatch.setattr(wp, "apply_retryable_outcome", apply_mock)
 
         parse_fn = MagicMock(
             return_value=ProviderEvent(

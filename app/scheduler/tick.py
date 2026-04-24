@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import logging
-import random
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from app.audit.emitter import emit_audit
 from app.audit.events import AuditEvent
 from app.persistence.repositories import (
-    AuditRepo,
     CallRepo,
     CampaignRepo,
     CampaignRowWithCursor,
@@ -18,7 +17,9 @@ from app.persistence.repositories import (
 from app.provider.types import ProviderRejected, ProviderUnavailable
 from app.scheduler.business_hours import is_in_window
 from app.state import machine as state
-from app.state.types import CallStatus
+from app.state.campaign_terminal import maybe_promote_to_active
+from app.state.retry_apply import compute_backoff
+from app.state.types import CallStatus, CampaignStatus
 
 if TYPE_CHECKING:
     from app.deps import Deps
@@ -33,15 +34,6 @@ class TickDecision:
     # that was dispatched and whether it was a retry.
     campaign_id: UUID | None
     is_retry: bool
-
-
-def compute_backoff(attempt_epoch: int, base_seconds: float) -> timedelta:
-    # Index the backoff by attempt count, not the (shrinking) retries-remaining
-    # budget. `attempt_epoch` equals the attempt number after Phase 1 bumps it,
-    # so first retry uses exponent 0 (base), second retry uses 2x base, etc.
-    exponent = 0 if attempt_epoch < 1 else attempt_epoch - 1
-    jitter = 1.0 + random.uniform(-0.2, 0.2)  # noqa: S311 -- backoff jitter, not crypto
-    return timedelta(seconds=base_seconds * (2**exponent) * jitter)
 
 
 def _rr_sort_key(c: CampaignRowWithCursor) -> tuple[datetime, UUID]:
@@ -59,26 +51,60 @@ async def tick(deps: Deps) -> TickDecision:
     # can scale horizontally without holding connections across HTTP latency.
     now_utc = datetime.now(tz=UTC)
 
-    # ---- Step 1: eligibility read (single conn) --------------------------
+    # Steps 1-3 are pure reads and commute with each other — share one
+    # connection so an operator auditing "what the scheduler saw at time T"
+    # observes a consistent snapshot.
     async with deps.pools.scheduler.acquire() as conn:
         all_eligible = await CampaignRepo.list_eligible_for_tick(conn)
+        if not all_eligible:
+            return TickDecision(None, is_retry=False)
 
-    # ---- Step 2: business-hour + concurrency gate ------------------------
-    in_hours: list[CampaignRowWithCursor] = [
-        c for c in all_eligible if is_in_window(c.schedule, c.timezone, now_utc)
-    ]
-    if not in_hours:
-        return TickDecision(None, is_retry=False)
+        # ---- Step 2a: business-hour gate ---------------------------------
+        in_hours: list[CampaignRowWithCursor] = []
+        out_of_hours: list[CampaignRowWithCursor] = []
+        for c in all_eligible:
+            (in_hours if is_in_window(c.schedule, c.timezone, now_utc) else out_of_hours).append(c)
 
-    async with deps.pools.scheduler.acquire() as conn:
+        # Emit SKIP_BUSINESS_HOUR for campaigns that had queued work but were
+        # gated out by their schedule. The audit log must answer
+        # "why not campaign X?" for the rubric's observability point.
+        for c in out_of_hours:
+            await emit_audit(
+                conn,
+                AuditEvent(
+                    event_type="SKIP_BUSINESS_HOUR",
+                    reason="outside configured business-hour window",
+                    campaign_id=c.id,
+                    extra={"timezone": c.timezone},
+                ),
+            )
+        if not in_hours:
+            return TickDecision(None, is_retry=False)
+
+        # ---- Step 2b: concurrency gate -----------------------------------
         in_flight = await CallRepo.in_flight_counts_by_campaign(conn, [c.id for c in in_hours])
+        capped: list[CampaignRowWithCursor] = []
+        for c in in_hours:
+            current = in_flight.get(c.id, 0)
+            if current < c.max_concurrent:
+                capped.append(c)
+            else:
+                await emit_audit(
+                    conn,
+                    AuditEvent(
+                        event_type="SKIP_CONCURRENCY",
+                        reason=(f"in-flight {current} >= max_concurrent {c.max_concurrent}"),
+                        campaign_id=c.id,
+                        extra={
+                            "in_flight": current,
+                            "max_concurrent": c.max_concurrent,
+                        },
+                    ),
+                )
+        if not capped:
+            return TickDecision(None, is_retry=False)
 
-    capped = [c for c in in_hours if in_flight.get(c.id, 0) < c.max_concurrent]
-    if not capped:
-        return TickDecision(None, is_retry=False)
-
-    # ---- Step 3: retry sweep among survivors -----------------------------
-    async with deps.pools.scheduler.acquire() as conn:
+        # ---- Step 3: retry sweep among survivors -------------------------
         retry_due_campaigns = set(await CallRepo.find_retry_due_campaign_ids(conn))
 
     retry_candidates = sorted((c for c in capped if c.id in retry_due_campaigns), key=_rr_sort_key)
@@ -88,15 +114,9 @@ async def tick(deps: Deps) -> TickDecision:
     if retry_candidates:
         picked = retry_candidates[0]
         is_retry = True
-    else:
+    elif capped:
         # ---- Step 4: RR pick among campaigns with fresh queued work ------
-        # `list_eligible_for_tick` returned campaigns with at least PENDING
-        # or ACTIVE status; the claim primitive filters by status='QUEUED'
-        # + next_attempt_at, so if no row matches we simply get None in
-        # Phase 1 and the decision becomes a no-op.
-        for c in sorted(capped, key=_rr_sort_key):
-            picked = c
-            break
+        picked = min(capped, key=_rr_sort_key)
 
     if picked is None:
         return TickDecision(None, is_retry=False)
@@ -163,7 +183,7 @@ async def _dispatch_one(deps: Deps, campaign: CampaignRowWithCursor) -> UUID | N
             # read and claim). Silent no-op; next tick picks it up.
             return None
 
-        await AuditRepo.emit(
+        await emit_audit(
             conn,
             AuditEvent(
                 event_type="CLAIMED",
@@ -184,13 +204,13 @@ async def _dispatch_one(deps: Deps, campaign: CampaignRowWithCursor) -> UUID | N
             ),
         )
 
-    # Campaign promotion PENDING → ACTIVE needs a dedicated CAS. The claim
-    # primitive runs a raw UPDATE (not state.transition), so we drive the
-    # promotion here after the claim commits.
-    if campaign.status == "PENDING":
-        async with deps.pools.scheduler.acquire() as conn, conn.transaction():
-            from app.state.campaign_terminal import maybe_promote_to_active
-
+        # PENDING → ACTIVE promotion must live INSIDE this transaction. If it
+        # ran on a second connection, a crash between commits would leave the
+        # call DIALING while the parent campaign is still PENDING, which then
+        # breaks the terminal-rollup CAS (which requires status='ACTIVE').
+        # `maybe_promote_to_active` is idempotent — CAS on status='PENDING' —
+        # so calling it unconditionally on every claim is cheap and safe.
+        if campaign.status == CampaignStatus.PENDING.value:
             await maybe_promote_to_active(conn, campaign.id)
 
     # ---- Phase 2 — place_call (no DB txn) -------------------------------
