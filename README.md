@@ -144,6 +144,7 @@ Calls retry on outcomes that might succeed on redial; they fail hard on outcomes
 - **Global calls-per-second throttle.** Assignment specifies per-campaign concurrency only.
 - **Inter-campaign weights.** Assignment specifies fairness within a campaign (retries first), not priority between campaigns.
 - **Conversation engine** (TTS / STT / LLM). Lives behind a separate `ConversationEngine` port. This service's job ends at the telephony boundary.
+- **Service-level decomposition** — splitting the monolith into separate services for webhook ingest, scheduler workers, per-provider adapters, and an analytics pipeline for the audit log. A shared event bus between services would replace the `webhook_inbox` Postgres table. Monolith is right at take-home scope; split when blast radius or team ownership demands it.
 
 ---
 
