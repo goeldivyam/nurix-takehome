@@ -77,8 +77,8 @@ Full DDL lives in `schema.sql`.
 
 - **`campaigns`** — campaign config (schedule, concurrency cap, retry policy) + lifecycle status.
 - **`calls`** — one row per phone per campaign. Status, attempt number, retries remaining. A partial unique index on `(phone)` prevents the same number being dialed twice at once.
-- **`scheduler_campaign_state`** — round-robin cursor per campaign so dispatch order survives restarts.
-- **`webhook_inbox`** — accepted provider events, keyed by `(provider, provider_event_id)` so replays are idempotent.
+- **`scheduler_campaign_state`** — stores `last_dispatch_at` per campaign so the scheduler can rotate fairly across campaigns, and the rotation survives restarts.
+- **`webhook_inbox`** — accepted provider events, keyed by `(provider, provider_event_id)` so replays are idempotent. Example row: when a call finishes, the provider pushes `{provider_event_id: "e-42", provider_call_id: "call-xyz", status: "COMPLETED"}` — the listener writes one row here, the processor reads it later.
 - **`scheduler_audit`** — append-only log of every decision and transition. Backs the UI.
 
 ---
@@ -93,7 +93,7 @@ Full DDL lives in `schema.sql`.
 
 1. **Eligibility.** Find campaigns in `PENDING` / `ACTIVE`, in business hours right now, with work to do.
 2. **Concurrency gate.** Drop any campaign already at its `max_concurrent`. Retries and new calls both pass through this gate — a retry on a saturated campaign waits exactly like a new call.
-3. **Retry sweep.** Among survivors, if any campaign has a retry whose backoff has elapsed, pick it first. **Retries beat new calls at the system level**, not per-campaign. When multiple campaigns have retries due, the same round-robin cursor decides who wins — no campaign's retry backlog monopolizes the slot.
+3. **Retry sweep.** Among survivors, if any campaign has a retry whose backoff has elapsed, pick it first. **Retries beat new calls at the system level**, not per-campaign. When multiple campaigns have retries due, the same round-robin order (by `last_dispatch_at`) decides who goes first — no campaign's retry backlog monopolizes the slot.
 4. **Round-robin pick.** Otherwise pick the campaign with the oldest `last_dispatch_at`.
 5. **Dispatch.** Claim the row, call the provider, record the outcome. One dispatch per tick. Every step writes an audit row with its reasoning.
 
