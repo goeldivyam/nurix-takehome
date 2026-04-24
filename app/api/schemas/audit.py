@@ -13,6 +13,8 @@ class AuditEventResponse(BaseModel):
     event_type: str
     campaign_id: UUID | None
     call_id: UUID | None
+    phone: str | None
+    attempt_epoch: int | None
     reason: str
     state_before: str | None
     state_after: str | None

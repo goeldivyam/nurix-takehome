@@ -190,10 +190,11 @@ async def _dispatch_one(deps: Deps, campaign: CampaignRowWithCursor) -> UUID | N
                 reason="claim for dispatch",
                 campaign_id=campaign.id,
                 call_id=claimed.id,
+                phone=claimed.phone,
+                attempt_epoch=claimed.attempt_epoch,
                 state_before="QUEUED",
                 state_after="DIALING",
                 extra={
-                    "attempt_epoch": claimed.attempt_epoch,
                     "in_flight_at_claim": in_flight_at_claim,
                     "max_concurrent": campaign.max_concurrent,
                     "retries_pending_system": retries_pending_system,
@@ -244,10 +245,9 @@ async def _dispatch_one(deps: Deps, campaign: CampaignRowWithCursor) -> UUID | N
                 expected_epoch=claimed.attempt_epoch,
                 event_type="DISPATCH",
                 reason="dispatched to provider",
-                extra={
-                    "provider_call_id": handle.provider_call_id,
-                    "attempt_epoch": claimed.attempt_epoch,
-                },
+                # attempt_epoch is a top-level audit column (denormalized
+                # emit-time snapshot) — don't duplicate it in extra.
+                extra={"provider_call_id": handle.provider_call_id},
                 column_updates={"provider_call_id": handle.provider_call_id},
             )
         elif outcome_tag == "REJECTED":

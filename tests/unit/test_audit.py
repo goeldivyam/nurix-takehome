@@ -4,7 +4,15 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.audit.reader import DEFAULT_LIMIT, MAX_LIMIT, decode_cursor, encode_cursor, query_audit
+from app.audit.reader import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    PHONE_FILTER_MIN_DIGITS,
+    decode_cursor,
+    encode_cursor,
+    normalize_phone_query,
+    query_audit,
+)
 
 
 class TestCursor:
@@ -25,6 +33,53 @@ class TestCursor:
         token = encode_cursor(ts, 1)
         # urlsafe encoding only emits A-Z a-z 0-9 - _ =
         assert all(c.isalnum() or c in "-_=" for c in token)
+
+
+class TestNormalizePhoneQuery:
+    # The normalizer is the security + UX boundary for the operator phone
+    # filter — it decides what an empty filter looks like (None → no-op),
+    # how a formatted human input is canonicalized ("+1 (415) 555-1234"
+    # → "14155551234"), and at what threshold the filter silently refuses
+    # to fire (minimum digits, to prevent a one-digit accidental scan of
+    # every phone-carrying audit row). The threshold is advertised as a
+    # module constant so this test can reason about it symbolically.
+
+    def test_none_returns_none(self) -> None:
+        assert normalize_phone_query(None) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        assert normalize_phone_query("") is None
+
+    def test_whitespace_only_returns_none(self) -> None:
+        assert normalize_phone_query("   ") is None
+
+    def test_below_threshold_returns_none(self) -> None:
+        # Threshold is PHONE_FILTER_MIN_DIGITS; any input with fewer
+        # effective digits than that must no-op. Avoids a naive "+1" input
+        # matching thousands of rows by accident.
+        assert PHONE_FILTER_MIN_DIGITS >= 3
+        assert normalize_phone_query("+1") is None
+        assert normalize_phone_query("12") is None
+
+    def test_exactly_at_threshold_passes(self) -> None:
+        # Exactly at the floor is the boundary the docstring promises.
+        assert normalize_phone_query("123") == "123"
+
+    def test_formatted_input_canonicalises_to_digits_only(self) -> None:
+        # Operators paste from CSVs, leads tools, customer tickets — all
+        # possible shapes for the same number must collapse to the same
+        # query so the URL round-trips canonically.
+        assert normalize_phone_query("+1 (415) 555-1234") == "14155551234"
+        assert normalize_phone_query("415-555-1234") == "4155551234"
+        assert normalize_phone_query("415.555.1234") == "4155551234"
+        assert normalize_phone_query(" +1 415 555 1234 ") == "14155551234"
+
+    def test_letters_stripped_same_as_other_non_digits(self) -> None:
+        # Pure noise input strips to nothing -> below threshold -> None.
+        assert normalize_phone_query("abc-xyz") is None
+        # Alphanumeric mix extracts only the digit run and applies the
+        # threshold check on the remainder.
+        assert normalize_phone_query("phone 5551234") == "5551234"
 
 
 class TestLimitBounds:

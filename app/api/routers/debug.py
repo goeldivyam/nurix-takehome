@@ -54,7 +54,7 @@ async def age_dialing(
             UPDATE calls
             SET updated_at = NOW() - ($2::int * INTERVAL '1 second')
             WHERE id = $1 AND status = 'DIALING'
-            RETURNING id, updated_at, campaign_id, attempt_epoch
+            RETURNING id, updated_at, campaign_id, phone, attempt_epoch
             """,
             call_id,
             by_seconds,
@@ -71,10 +71,9 @@ async def age_dialing(
                 reason=f"aged updated_at by {by_seconds}s for reclaim demo",
                 campaign_id=row["campaign_id"],
                 call_id=call_id,
-                extra={
-                    "aged_by_seconds": by_seconds,
-                    "attempt_epoch": row["attempt_epoch"],
-                },
+                phone=row["phone"],
+                attempt_epoch=row["attempt_epoch"],
+                extra={"aged_by_seconds": by_seconds},
             ),
         )
     return AgeDialingResponse(

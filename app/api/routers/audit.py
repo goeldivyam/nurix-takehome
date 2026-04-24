@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.schemas.audit import AuditEventResponse, AuditListResponse
-from app.audit.reader import query_audit
+from app.audit.reader import normalize_phone_query, query_audit
 from app.deps import Deps
 
 router = APIRouter(tags=["audit"])
@@ -27,6 +27,10 @@ DepsDep = Annotated[Deps, Depends(get_deps)]
 async def list_audit(
     deps: DepsDep,
     campaign_id: Annotated[UUID | None, Query()] = None,
+    call_id: Annotated[
+        UUID | None,
+        Query(description="Filter to a single call's lifecycle."),
+    ] = None,
     event_type: Annotated[
         str | None,
         Query(description="Single event type or comma-separated list (OR-composed)."),
@@ -34,6 +38,17 @@ async def list_audit(
     from_ts: Annotated[datetime | None, Query()] = None,
     to_ts: Annotated[datetime | None, Query()] = None,
     reason_contains: Annotated[str | None, Query()] = None,
+    phone: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Operator-facing phone filter. Server strips every non-digit, "
+                "requires at least 3 digits, and substring-matches against the "
+                "denormalized `phone` column. Inputs below the threshold "
+                "silently no-op so a share URL with a typo doesn't break."
+            ),
+        ),
+    ] = None,
     cursor: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> AuditListResponse:
@@ -49,13 +64,21 @@ async def list_audit(
         elif len(items) == 1:
             event_filter = items[0]
 
+    # Normalize the phone-filter input once at the boundary. The reader
+    # re-normalizes defensively, but routing only the canonical digit
+    # string onward keeps the URL-round-trip contract stable (whatever the
+    # operator typed, the backend matched on the same digit-only form).
+    phone_digits = normalize_phone_query(phone)
+
     rows, next_cursor = await query_audit(
         deps.pools.api,
         campaign_id=campaign_id,
+        call_id=call_id,
         event_type=event_filter,
         from_ts=from_ts,
         to_ts=to_ts,
         reason_contains=reason_contains,
+        phone=phone_digits,
         cursor=cursor,
         limit=limit,
     )
@@ -66,6 +89,8 @@ async def list_audit(
             event_type=r.event_type,
             campaign_id=r.campaign_id,
             call_id=r.call_id,
+            phone=r.phone,
+            attempt_epoch=r.attempt_epoch,
             reason=r.reason,
             state_before=r.state_before,
             state_after=r.state_after,

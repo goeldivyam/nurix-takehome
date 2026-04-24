@@ -15,13 +15,15 @@ async def emit_audit(conn: asyncpg.Connection[Any], event: AuditEvent) -> None:
     await conn.execute(
         """
         INSERT INTO scheduler_audit
-            (event_type, campaign_id, call_id, reason,
+            (event_type, campaign_id, call_id, phone, attempt_epoch, reason,
              state_before, state_after, extra)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
         """,
         event.event_type,
         event.campaign_id,
         event.call_id,
+        event.phone,
+        event.attempt_epoch,
         event.reason,
         event.state_before,
         event.state_after,

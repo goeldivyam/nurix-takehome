@@ -148,6 +148,14 @@ async def transition(
 
     row_dict: dict[str, Any] = dict(row)
 
+    # `phone` and `attempt_epoch` are denormalized emit-time snapshots on
+    # the audit row. The CAS UPDATE above used `RETURNING *` so row_dict
+    # already carries both — no extra query on the hot path. This one site
+    # covers every audit event emitted via state.transition (CLAIMED from
+    # reclaim path, DISPATCH, TRANSITION, RECLAIM_EXECUTED,
+    # RECLAIM_SKIPPED_TERMINAL). Emitters outside state.transition (tick's
+    # own CLAIMED, webhook_processor WEBHOOK_IGNORED_STALE, debug) populate
+    # these fields themselves from the call row already in scope.
     await emit_audit(
         conn,
         AuditEvent(
@@ -155,6 +163,8 @@ async def transition(
             reason=reason,
             campaign_id=row_dict["campaign_id"],
             call_id=call_id,
+            phone=row_dict.get("phone"),
+            attempt_epoch=row_dict.get("attempt_epoch"),
             state_before=expected_status_str,
             state_after=new_status_str,
             extra=extra or {},

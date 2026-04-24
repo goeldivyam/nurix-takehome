@@ -202,7 +202,7 @@ async def _audit_rows_for_call(
         rows = await conn.fetch(
             """
             SELECT event_type, state_before, state_after, reason, extra,
-                   call_id, campaign_id
+                   call_id, campaign_id, phone, attempt_epoch
             FROM scheduler_audit
             WHERE call_id = $1
             ORDER BY id ASC
@@ -261,16 +261,20 @@ class TestSchedulerTickIntegration:
             import json
 
             extra = json.loads(extra)
-        # Key shape is contract-stable: every CLAIMED row carries the full
-        # observability quintet so operators can see why the scheduler picked
-        # this row now.
+        # `attempt_epoch` is a top-level column on scheduler_audit now (so
+        # a phone-scoped operator query can read it without JSON extract);
+        # it is NOT duplicated inside `extra`. The remaining four keys —
+        # load snapshots that make the claim decision explainable in
+        # hindsight — stay in the JSON blob.
         assert set(extra.keys()) >= {
-            "attempt_epoch",
             "in_flight_at_claim",
             "max_concurrent",
             "retries_pending_system",
             "rr_cursor_before",
         }
+        assert "attempt_epoch" not in extra
+        assert claimed["attempt_epoch"] == 1
+        assert claimed["phone"] == "+14155550010"
         assert extra["rr_cursor_before"] is None
         # in_flight_at_claim is the PRE-claim snapshot so the scheduler
         # records the load it dispatched against, not post-UPDATE state.
@@ -278,7 +282,6 @@ class TestSchedulerTickIntegration:
         assert extra["in_flight_at_claim"] == 0
         assert extra["retries_pending_system"] == 0
         assert extra["max_concurrent"] == 5
-        assert extra["attempt_epoch"] == 1
 
     async def test_retry_before_new_system_level(self, deps: Deps) -> None:
         # A: 1 RETRY_PENDING due. B: 10 QUEUED. A wins the tick's retry sweep
@@ -611,7 +614,10 @@ class TestSchedulerTickIntegration:
         assert len(claimed) == 1
         assert len(dispatch) == 1
         # CLAIMED + DISPATCH share the same attempt_epoch for the call.
-        assert claimed[0].extra.get("attempt_epoch") == dispatch[0].extra.get("attempt_epoch")
+        # Both now surface epoch as a top-level AuditRow field (denormalized
+        # from the call row at emit time), not inside the JSONB `extra` bag.
+        assert claimed[0].attempt_epoch is not None
+        assert claimed[0].attempt_epoch == dispatch[0].attempt_epoch
 
 
 # -- Helpers (provider stubs + audit introspection) ------------------------

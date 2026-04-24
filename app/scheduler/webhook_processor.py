@@ -170,6 +170,8 @@ async def _process_one_row(deps: Deps) -> _RowOutcome:
                         event_type="WEBHOOK_IGNORED_STALE",
                         campaign_id=call.campaign_id,
                         call_id=call.id,
+                        phone=call.phone,
+                        attempt_epoch=call.attempt_epoch,
                         reason=reason,
                         extra=extra,
                     ),

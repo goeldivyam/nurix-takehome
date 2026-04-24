@@ -82,16 +82,28 @@ CREATE INDEX IF NOT EXISTS webhook_inbox_unprocessed_idx
     ON webhook_inbox (processed_at) WHERE processed_at IS NULL;
 
 -- Scheduler audit log (observability surface) ------------------------------
+-- `phone` and `attempt_epoch` are denormalized emit-time snapshots of the
+-- call-scoped context that produced this row. They stay NULL for campaign-
+-- level events (SKIP_CONCURRENCY / SKIP_BUSINESS_HOUR / CAMPAIGN_PROMOTED_ACTIVE
+-- / CAMPAIGN_COMPLETED). The rule for expanding these columns is strict:
+-- denormalize only IMMUTABLE call-identity or EMIT-TIME snapshot fields.
+-- Phone is immutable per call_id (set once in CallRepo.create_batch, never
+-- mutated). attempt_epoch varies across a call's lifetime, but the value at
+-- emit time is the specific attempt this event belongs to — forensic truth,
+-- not live state. Mutable fields like `retries_remaining` or `status` MUST
+-- NOT be denormalized here; their live value belongs on the calls table.
 CREATE TABLE IF NOT EXISTS scheduler_audit (
-    id            BIGSERIAL   PRIMARY KEY,
-    ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    event_type    TEXT        NOT NULL,
-    campaign_id   UUID        NULL,
-    call_id       UUID        NULL,
-    reason        TEXT        NOT NULL,
-    state_before  TEXT        NULL,
-    state_after   TEXT        NULL,
-    extra         JSONB       NOT NULL DEFAULT '{}'::jsonb
+    id             BIGSERIAL   PRIMARY KEY,
+    ts             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_type     TEXT        NOT NULL,
+    campaign_id    UUID        NULL,
+    call_id        UUID        NULL,
+    phone          TEXT        NULL,
+    attempt_epoch  INT         NULL,
+    reason         TEXT        NOT NULL,
+    state_before   TEXT        NULL,
+    state_after    TEXT        NULL,
+    extra          JSONB       NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX IF NOT EXISTS scheduler_audit_ts_id_idx
@@ -102,3 +114,20 @@ CREATE INDEX IF NOT EXISTS scheduler_audit_campaign_ts_idx
 
 CREATE INDEX IF NOT EXISTS scheduler_audit_event_ts_idx
     ON scheduler_audit (event_type, ts DESC);
+
+-- Partial index for the operator phone-substring filter:
+-- `SELECT ... WHERE phone LIKE '%<digits>%' ORDER BY ts DESC`.
+-- Phone IS NOT NULL keeps campaign-level rows out of the index. Leading-
+-- wildcard LIKE can't use the btree for pruning, but the (phone, ts DESC)
+-- shape keeps the ORDER BY index-covered on the candidate set.
+CREATE INDEX IF NOT EXISTS scheduler_audit_phone_ts_idx
+    ON scheduler_audit (phone, ts DESC) WHERE phone IS NOT NULL;
+
+-- Idempotent ALTERs guard against a partially-migrated database where the
+-- CREATE TABLE above was already applied (without the new columns) on an
+-- earlier container start. `CREATE TABLE IF NOT EXISTS` is a no-op when the
+-- table exists, so column additions must come through ADD COLUMN IF NOT
+-- EXISTS to reach those rows without a `make reset-db`. Both ALTERs are
+-- constant-time catalog updates on empty/nullable columns.
+ALTER TABLE scheduler_audit ADD COLUMN IF NOT EXISTS phone TEXT NULL;
+ALTER TABLE scheduler_audit ADD COLUMN IF NOT EXISTS attempt_epoch INT NULL;

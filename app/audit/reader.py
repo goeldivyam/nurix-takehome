@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,6 +14,33 @@ import asyncpg
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 100
 
+# Operators type phones in many shapes ("415-555-1234", "(415) 555 1234",
+# "+1 415 555 1234", or the tail "5309"). The filter strips everything but
+# digits, then requires at least this many to fire — below the threshold
+# the filter is a silent no-op (matches the reason-contains pattern: empty
+# input = no filter). Above it, we substring-match against the E.164
+# `phone` column (`LIKE '%<digits>%'`). Exact match against full E.164
+# would force operators to remember the country code; substring matches
+# the real "I only have the last four" workflow.
+_DIGITS_RE = re.compile(r"\D+")
+PHONE_FILTER_MIN_DIGITS = 3
+
+
+def normalize_phone_query(raw: str | None) -> str | None:
+    """Strip to digits and return None if below the minimum threshold.
+
+    Returns None for inputs that should produce a no-op filter (empty,
+    whitespace, fewer than PHONE_FILTER_MIN_DIGITS digits after stripping).
+    Never raises — invalid shapes silently become no-ops so a share URL
+    with junk doesn't 500 the audit page.
+    """
+    if raw is None:
+        return None
+    digits = _DIGITS_RE.sub("", raw)
+    if len(digits) < PHONE_FILTER_MIN_DIGITS:
+        return None
+    return digits
+
 
 @dataclass(frozen=True, slots=True)
 class AuditRow:
@@ -21,6 +49,8 @@ class AuditRow:
     event_type: str
     campaign_id: UUID | None
     call_id: UUID | None
+    phone: str | None
+    attempt_epoch: int | None
     reason: str
     state_before: str | None
     state_after: str | None
@@ -54,10 +84,12 @@ async def query_audit(
     api_pool: asyncpg.Pool[Any],
     *,
     campaign_id: UUID | None = None,
+    call_id: UUID | None = None,
     event_type: str | Sequence[str] | None = None,
     from_ts: datetime | None = None,
     to_ts: datetime | None = None,
     reason_contains: str | None = None,
+    phone: str | None = None,
     cursor: str | None = None,
     limit: int = DEFAULT_LIMIT,
 ) -> tuple[list[AuditRow], str | None]:
@@ -73,6 +105,8 @@ async def query_audit(
 
     if campaign_id is not None:
         clauses.append(f"campaign_id = {bind(campaign_id)}")
+    if call_id is not None:
+        clauses.append(f"call_id = {bind(call_id)}")
     if event_type is not None:
         if isinstance(event_type, str):
             clauses.append(f"event_type = {bind(event_type)}")
@@ -87,6 +121,19 @@ async def query_audit(
         # accidentally match every row.
         escaped = reason_contains.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         clauses.append(f"reason ILIKE {bind(f'%{escaped}%')}")
+    if phone:
+        # Caller is responsible for running `normalize_phone_query` before
+        # passing; doing it here again is belt-and-suspenders against a
+        # caller that forgot. Escape LIKE meta-chars that could survive
+        # digit-stripping (none today, but defense-in-depth is cheap).
+        digits = _DIGITS_RE.sub("", phone)
+        if len(digits) >= PHONE_FILTER_MIN_DIGITS:
+            escaped = digits.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            # Partial index `(phone, ts DESC) WHERE phone IS NOT NULL` gives
+            # us the ordered candidate set; the leading-wildcard LIKE then
+            # filters inside it. Campaign-level rows (phone NULL) are
+            # naturally excluded by the column predicate.
+            clauses.append(f"phone LIKE {bind(f'%{escaped}%')}")
     if cursor is not None:
         cursor_ts, cursor_id = decode_cursor(cursor)
         clauses.append(f"(ts, id) < ({bind(cursor_ts)}, {bind(cursor_id)})")
@@ -97,8 +144,8 @@ async def query_audit(
     # All user-supplied values travel via $N placeholders; `where_sql` and
     # `limit_placeholder` are built from static fragments owned here.
     sql = (
-        "SELECT id, ts, event_type, campaign_id, call_id, reason, "  # noqa: S608
-        "state_before, state_after, extra "
+        "SELECT id, ts, event_type, campaign_id, call_id, phone, "  # noqa: S608
+        "attempt_epoch, reason, state_before, state_after, extra "
         f"FROM scheduler_audit {where_sql} "
         f"ORDER BY ts DESC, id DESC LIMIT {limit_placeholder}"
     )
@@ -113,6 +160,8 @@ async def query_audit(
             event_type=r["event_type"],
             campaign_id=r["campaign_id"],
             call_id=r["call_id"],
+            phone=r["phone"],
+            attempt_epoch=r["attempt_epoch"],
             reason=r["reason"],
             state_before=r["state_before"],
             state_after=r["state_after"],

@@ -140,12 +140,11 @@ def test_full_stack_fairness_retries_and_audit_shape(client: httpx.Client) -> No
             "/audit",
             params={"campaign_id": cid, "event_type": "DISPATCH", "limit": 500},
         )
-        claimed = {
-            (e["call_id"], e["extra"].get("attempt_epoch")) for e in r_claimed.json()["events"]
-        }
-        dispatched = {
-            (e["call_id"], e["extra"].get("attempt_epoch")) for e in r_dispatch.json()["events"]
-        }
+        # `attempt_epoch` is a top-level audit column after the phone-
+        # visibility delta; it used to live in `extra`. The pairing key
+        # stays (call_id, attempt_epoch) — just off the typed column now.
+        claimed = {(e["call_id"], e["attempt_epoch"]) for e in r_claimed.json()["events"]}
+        dispatched = {(e["call_id"], e["attempt_epoch"]) for e in r_dispatch.json()["events"]}
         # Every DISPATCH must have a matching CLAIMED key. CLAIMED may
         # have extras without a DISPATCH (rejected / unavailable paths).
         missing = dispatched - claimed
@@ -160,22 +159,31 @@ def test_full_stack_fairness_retries_and_audit_shape(client: httpx.Client) -> No
         params={"campaign_id": a["id"], "event_type": "CLAIMED", "limit": 1},
     )
     r.raise_for_status()
-    sample = r.json()["events"][0]["extra"]
-    expected_keys = {
-        "attempt_epoch",
+    sample = r.json()["events"][0]
+    # `attempt_epoch` and `phone` are top-level columns on scheduler_audit
+    # now. The remaining four scheduler-decision fields stay in `extra`
+    # because they only apply to CLAIMED + DISPATCH and would pollute the
+    # common audit column set.
+    assert isinstance(sample["attempt_epoch"], int)
+    assert isinstance(sample["phone"], str)
+    assert sample["phone"].startswith("+")
+    extra = sample["extra"]
+    expected_extra_keys = {
         "in_flight_at_claim",
         "max_concurrent",
         "retries_pending_system",
         "rr_cursor_before",
     }
-    assert expected_keys <= set(sample.keys()), (
-        f"CLAIMED.extra missing keys: {expected_keys - set(sample.keys())}"
+    assert expected_extra_keys <= set(extra.keys()), (
+        f"CLAIMED.extra missing keys: {expected_extra_keys - set(extra.keys())}"
     )
-    assert isinstance(sample["attempt_epoch"], int)
-    assert isinstance(sample["in_flight_at_claim"], int)
-    assert isinstance(sample["max_concurrent"], int)
-    assert isinstance(sample["retries_pending_system"], int)
-    assert sample["rr_cursor_before"] is None or isinstance(sample["rr_cursor_before"], str)
+    assert "attempt_epoch" not in extra, (
+        "attempt_epoch is a top-level audit column; do not duplicate it in extra"
+    )
+    assert isinstance(extra["in_flight_at_claim"], int)
+    assert isinstance(extra["max_concurrent"], int)
+    assert isinstance(extra["retries_pending_system"], int)
+    assert extra["rr_cursor_before"] is None or isinstance(extra["rr_cursor_before"], str)
 
     # ---- Status mapping (sample one completed + one failed if any) ---
     r = client.get(
@@ -203,11 +211,16 @@ def test_full_stack_fairness_retries_and_audit_shape(client: httpx.Client) -> No
     assert sampled >= 1
 
     # ---- Campaign status rolled up -----------------------------------
+    # The campaign API surfaces the external vocabulary the assignment
+    # enumerates (pending / in_progress / completed / failed); the audit
+    # rows above still assert against the internal state-machine vocabulary
+    # because the audit log is forensic — it must match the CAS the state
+    # machine ran.
     for cid in (a["id"], b["id"]):
         r = client.get(f"/campaigns/{cid}")
         r.raise_for_status()
         cdata = r.json()
-        assert cdata["status"] in {"COMPLETED", "FAILED"}
+        assert cdata["status"] in {"completed", "failed"}
 
 
 def test_campaign_status_progression_and_audit_chronology(client: httpx.Client) -> None:
@@ -221,7 +234,10 @@ def test_campaign_status_progression_and_audit_chronology(client: httpx.Client) 
         max_attempts=1,
     )
     cid = created["id"]
-    assert created["status"] == "PENDING"
+    # External vocabulary at the API boundary. Internal DB column is still
+    # PENDING; the audit-row assertions below check that CAMPAIGN_PROMOTED_ACTIVE
+    # was emitted (internal state_after="ACTIVE") as the forensic witness.
+    assert created["status"] == "pending"
 
     # Drain.
     _wait_for_drain(client, [cid], timeout_s=60)
