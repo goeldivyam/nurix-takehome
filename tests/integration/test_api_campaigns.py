@@ -159,11 +159,14 @@ class TestPostCampaign:
         body = _valid_campaign_body(phones=["+14155551234", "not-a-phone", "12345"])
         resp = await client.post("/campaigns", json=body)
         assert resp.status_code == 422, resp.text
-        blob = resp.text
-        assert "invalid_phones" in blob
-        # The two bad entries were at indices 1 and 2.
-        assert "'index': 1" in blob
-        assert "'index': 2" in blob
+        # The structured payload lives at ctx.invalid_phones so the frontend
+        # can render per-line errors without regex-parsing a message string.
+        detail = resp.json()["detail"]
+        assert isinstance(detail, list)
+        assert detail[0]["type"] == "invalid_phones"
+        invalid = detail[0]["ctx"]["invalid_phones"]
+        indices = {item["index"] for item in invalid}
+        assert indices == {1, 2}
 
     async def test_post_zero_valid_phones_after_normalization(self, client: AsyncClient) -> None:
         resp = await client.post("/campaigns", json=_valid_campaign_body(phones=["not-a-phone"]))

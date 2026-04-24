@@ -125,10 +125,12 @@ def main() -> int:
             print("[reclaim] timed out waiting for reclaim event")
             return 1
 
+        # URL query goes BEFORE the hash — audit.js reads filters from
+        # window.location.search, not from hash fragments.
         filtered = (
-            f"{BASE_URL}/ui/#audit?campaign_id={campaign_id}"
+            f"{BASE_URL}/ui/?campaign_id={campaign_id}"
             "&event_type=CLAIMED,DEBUG_AGE_DIALING,RECLAIM_EXECUTED,"
-            "RECLAIM_SKIPPED_TERMINAL,TRANSITION"
+            "RECLAIM_SKIPPED_TERMINAL,TRANSITION#audit"
         )
         print(f"\n[reclaim] open this URL to see the full reclaim story:\n  {filtered}")
     return 0

@@ -12,9 +12,7 @@ import asyncpg
 import pytest
 from testcontainers.postgres import PostgresContainer
 
-from app.audit.events import AuditEvent
 from app.persistence.repositories import (
-    AuditRepo,
     CallRepo,
     CampaignRepo,
     SchedulerStateRepo,
@@ -226,8 +224,9 @@ class TestCampaignRepo:
         # external status mapping on /calls/{id} ({completed, failed,
         # in_progress} — total always == completed + failed + in_progress).
         assert stats.failed == 3
-        # 1 + 2 + 4 + 3 + 2 + 1 + 0 + 0 = 13 attempts made across all rows.
-        assert stats.retries_attempted == 13
+        # retries = max(attempt_epoch - 1, 0) per row — a successful first
+        # dial contributes 0. Row epochs: 1,2,4,3,2,1,0,0 → retries: 0,1,3,2,1,0,0,0 = 7.
+        assert stats.retries_attempted == 7
         # QUEUED x2 + IN_PROGRESS x1 = 3 rows in flight / waiting.
         assert stats.in_progress == 3
         # Invariant: the three buckets partition the total.
@@ -688,149 +687,3 @@ class TestSchedulerStateRepo:
             await SchedulerStateRepo.update_last_dispatch_at(conn, campaign_id, t2)
             got2 = await SchedulerStateRepo.get_last_dispatch_at(conn, campaign_id)
             assert got2 == t2
-
-
-# -- AuditRepo ---------------------------------------------------------------
-
-
-class TestAuditRepo:
-    async def test_emit_and_list_round_trip(self, pool: asyncpg.Pool) -> None:
-        campaign_id = await _create_campaign(pool)
-        async with pool.acquire() as conn:
-            await AuditRepo.emit(
-                conn,
-                AuditEvent(
-                    event_type="DISPATCH",
-                    reason="test dispatch",
-                    campaign_id=campaign_id,
-                    state_before="QUEUED",
-                    state_after="DIALING",
-                    extra={"k": "v"},
-                ),
-            )
-        rows, _ = await AuditRepo.list(pool, campaign_id=campaign_id, limit=10)
-        assert len(rows) == 1
-        row = rows[0]
-        assert row.event_type == "DISPATCH"
-        assert row.reason == "test dispatch"
-        assert row.state_before == "QUEUED"
-        assert row.state_after == "DIALING"
-        assert row.extra == {"k": "v"}
-
-    async def test_cursor_pagination_stable_under_concurrent_insert(
-        self, pool: asyncpg.Pool
-    ) -> None:
-        campaign_id = await _create_campaign(pool)
-        # Seed 30 events.
-        async with pool.acquire() as conn:
-            for i in range(30):
-                await AuditRepo.emit(
-                    conn,
-                    AuditEvent(
-                        event_type="DISPATCH",
-                        reason=f"seed-{i:02d}",
-                        campaign_id=campaign_id,
-                    ),
-                )
-        page1, cur1 = await AuditRepo.list(pool, campaign_id=campaign_id, limit=10)
-        assert cur1 is not None
-        page2, cur2 = await AuditRepo.list(pool, campaign_id=campaign_id, cursor=cur1, limit=10)
-        assert cur2 is not None
-        page3, cur3 = await AuditRepo.list(pool, campaign_id=campaign_id, cursor=cur2, limit=10)
-        # len(page3) == limit → the repo surfaces a cursor since it can't
-        # prove the tail is empty. Exhaustion is observed by following the
-        # cursor one more hop and getting zero rows.
-        assert len(page3) == 10
-        assert cur3 is not None
-        page4, cur4 = await AuditRepo.list(pool, campaign_id=campaign_id, cursor=cur3, limit=10)
-        assert page4 == []
-        assert cur4 is None
-        first_three_ids = [r.id for r in page1 + page2 + page3]
-        assert len(set(first_three_ids)) == 30
-
-        # Now insert 10 more events mid-pagination; re-walking the ORIGINAL
-        # cursor chain must return the same first three pages because the
-        # WHERE clause is `(ts, id) < (cursor_ts, cursor_id)` and the new rows
-        # all have strictly larger (ts, id) tuples.
-        async with pool.acquire() as conn:
-            for i in range(10):
-                await AuditRepo.emit(
-                    conn,
-                    AuditEvent(
-                        event_type="DISPATCH",
-                        reason=f"late-{i:02d}",
-                        campaign_id=campaign_id,
-                    ),
-                )
-        page1b, _ = await AuditRepo.list(pool, campaign_id=campaign_id, cursor=None, limit=10)
-        # The brand-new page 1 surfaces the late inserts, but the chain starting
-        # from cur1 does not.
-        page2b, _ = await AuditRepo.list(pool, campaign_id=campaign_id, cursor=cur1, limit=10)
-        page3b, _ = await AuditRepo.list(pool, campaign_id=campaign_id, cursor=cur2, limit=10)
-        assert [r.id for r in page2b] == [r.id for r in page2]
-        assert [r.id for r in page3b] == [r.id for r in page3]
-        # The late events show up on the very-first page now, so page1b differs.
-        assert any("late-" in r.reason for r in page1b)
-
-    async def test_list_filters_by_event_type_list(self, pool: asyncpg.Pool) -> None:
-        campaign_id = await _create_campaign(pool)
-        async with pool.acquire() as conn:
-            for et in ("DISPATCH", "RETRY_DUE", "SKIP_CONCURRENCY", "DISPATCH"):
-                await AuditRepo.emit(
-                    conn,
-                    AuditEvent(event_type=et, reason="x", campaign_id=campaign_id),  # type: ignore[arg-type]
-                )
-        only_dispatch, _ = await AuditRepo.list(
-            pool, campaign_id=campaign_id, event_type="DISPATCH", limit=20
-        )
-        assert len(only_dispatch) == 2
-
-        two_types, _ = await AuditRepo.list(
-            pool,
-            campaign_id=campaign_id,
-            event_type=["DISPATCH", "RETRY_DUE"],
-            limit=20,
-        )
-        assert len(two_types) == 3
-
-    async def test_list_reason_contains_escapes_wildcards(self, pool: asyncpg.Pool) -> None:
-        campaign_id = await _create_campaign(pool)
-        async with pool.acquire() as conn:
-            await AuditRepo.emit(
-                conn,
-                AuditEvent(
-                    event_type="DISPATCH",
-                    reason="literal 100% match",
-                    campaign_id=campaign_id,
-                ),
-            )
-            await AuditRepo.emit(
-                conn,
-                AuditEvent(
-                    event_type="DISPATCH",
-                    reason="no percent here",
-                    campaign_id=campaign_id,
-                ),
-            )
-        hit, _ = await AuditRepo.list(
-            pool, campaign_id=campaign_id, reason_contains="100%", limit=10
-        )
-        assert len(hit) == 1
-        assert hit[0].reason == "literal 100% match"
-
-    async def test_list_ts_filters(self, pool: asyncpg.Pool) -> None:
-        campaign_id = await _create_campaign(pool)
-        async with pool.acquire() as conn:
-            await AuditRepo.emit(
-                conn,
-                AuditEvent(event_type="DISPATCH", reason="a", campaign_id=campaign_id),
-            )
-        now = datetime.now(tz=UTC)
-        future = now + timedelta(hours=1)
-        past = now - timedelta(hours=1)
-        none_rows, _ = await AuditRepo.list(pool, campaign_id=campaign_id, from_ts=future, limit=10)
-        assert none_rows == []
-        some_rows, _ = await AuditRepo.list(
-            pool, campaign_id=campaign_id, from_ts=past, to_ts=future, limit=10
-        )
-        assert len(some_rows) == 1

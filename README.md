@@ -313,6 +313,28 @@ terminal rollup in under a minute.
   country code (+1…, +91…) so the partial unique index on `(phone)` is
   unambiguous.
 
+### Scope boundary — voice-AI stack
+
+This service is a **campaign orchestrator**. Its responsibility ends at
+the telephony boundary. The surfaces around it are explicit ports, not
+features we build here:
+
+- **`TelephonyProvider`** (the port in `app/provider/base.py`) is a
+  call-placement and call-status contract: `place_call`, `get_status`,
+  `aclose`. Swapping the mock for a real adapter (Twilio / Retell /
+  Vapi) is a one-file change with no scheduler / state edits.
+- **Conversation engine** (TTS / STT / LLM, barge-in, audio pipeline)
+  is out of scope — it sits behind its own `ConversationEngine` port
+  invoked by the telephony provider on media events, not by our
+  scheduler. The campaign layer passes a `script_ref` down through
+  `place_call` and the engine resolves the audio loop independently.
+  This matches how Retell and Vapi decompose the stack: telephony is
+  I/O-bound, conversation is GPU-bound; they scale and version
+  separately.
+- **Per-country routing**, **AMD sub-codes**, **global CPS throttle**,
+  **pause/resume** — all deferred. The abstractions support them; the
+  assignment's scope does not require them. See Future Work.
+
 ---
 
 ## Fault tolerance

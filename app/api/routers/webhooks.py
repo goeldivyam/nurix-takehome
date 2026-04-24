@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -17,12 +17,15 @@ def get_deps(request: Request) -> Deps:
     return deps
 
 
-# FastAPI's Depends-in-default idiom is the framework's canonical signature
-# shape; B008 is suppressed per line rather than re-architecting.
+# Using the Annotated[..., Depends(...)] form keeps FastAPI's DI idiom
+# while avoiding the B008 "function call in default argument" lint.
+DepsDep = Annotated[Deps, Depends(get_deps)]
+
+
 @router.post("/webhooks/provider", response_model=WebhookIngestResponse)
 async def receive_webhook(
     request: Request,
-    deps: Deps = Depends(get_deps),  # noqa: B008
+    deps: DepsDep,
 ) -> WebhookIngestResponse:
     # Raw body is needed for signature verification — JSON round-trip would
     # change byte-level whitespace and invalidate the HMAC on real adapters.

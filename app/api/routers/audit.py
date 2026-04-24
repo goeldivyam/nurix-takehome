@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -17,22 +18,24 @@ def get_deps(request: Request) -> Deps:
     return deps
 
 
-# FastAPI's Depends/Query-in-default idiom is the framework's canonical
-# signature shape; B008 (do-not-call-in-defaults) is suppressed per line
-# rather than re-architecting away from the idiom.
+# Using the Annotated[..., Depends/Query(...)] form keeps FastAPI's DI idiom
+# while avoiding the B008 "function call in default argument" lint.
+DepsDep = Annotated[Deps, Depends(get_deps)]
+
+
 @router.get("/audit", response_model=AuditListResponse)
 async def list_audit(
-    campaign_id: UUID | None = Query(default=None),  # noqa: B008
-    event_type: str | None = Query(
-        default=None,
-        description="Single event type or comma-separated list (OR-composed).",
-    ),
-    from_ts: datetime | None = Query(default=None),  # noqa: B008
-    to_ts: datetime | None = Query(default=None),  # noqa: B008
-    reason_contains: str | None = Query(default=None),
-    cursor: str | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-    deps: Deps = Depends(get_deps),  # noqa: B008
+    deps: DepsDep,
+    campaign_id: Annotated[UUID | None, Query()] = None,
+    event_type: Annotated[
+        str | None,
+        Query(description="Single event type or comma-separated list (OR-composed)."),
+    ] = None,
+    from_ts: Annotated[datetime | None, Query()] = None,
+    to_ts: Annotated[datetime | None, Query()] = None,
+    reason_contains: Annotated[str | None, Query()] = None,
+    cursor: Annotated[str | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> AuditListResponse:
     # The query param accepts a single name or a comma-separated list. The
     # reader's public shape uses `str` for a single value and a sequence for

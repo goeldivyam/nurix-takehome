@@ -12,9 +12,12 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
+from http import HTTPStatus
 from pathlib import Path
 
 import asyncpg
+import httpx
 
 
 def _dsn() -> str:
@@ -70,6 +73,27 @@ def _run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)  # noqa: S603
 
 
+def _wait_for_health() -> None:
+    # After `docker compose up -d app` returns, the container is RUNNING but
+    # uvicorn + lifespan haven't finished booting. A naive
+    # `make demo-reset && make demo-fairness` chain deterministically hits
+    # a "Connection reset by peer" on the first POST without this gate.
+    # Poll /health until 200 or timeout.
+    base = os.environ.get("APP_BASE_URL", "http://localhost:8001")
+    deadline = time.monotonic() + 30.0
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base}/health", timeout=2.0)
+            if resp.status_code == HTTPStatus.OK:
+                return
+            last_error = f"status {resp.status_code}"
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+    print(f"[reset] WARNING: /health never came green (last: {last_error})")
+
+
 def main() -> int:
     # Stop the app (but NOT postgres) so in-flight scheduler connections
     # release cleanly before the TRUNCATE. `stop` is correct here — the
@@ -81,6 +105,7 @@ def main() -> int:
         # `up -d app` (not `start`) so if the container was removed for any
         # reason, it gets recreated rather than failing silently.
         _run(["docker", "compose", "up", "-d", "app"])
+    _wait_for_health()
     print("[reset] ready")
     return 0
 

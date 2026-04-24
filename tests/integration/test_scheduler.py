@@ -12,12 +12,11 @@ import asyncpg
 import pytest
 from testcontainers.postgres import PostgresContainer
 
-from app.audit.events import AuditEvent
+from app.audit.reader import query_audit
 from app.config import Settings
 from app.deps import Deps
 from app.persistence.pools import Pools
 from app.persistence.repositories import (
-    AuditRepo,
     CallRepo,
     CampaignRepo,
     SchedulerStateRepo,
@@ -606,7 +605,7 @@ class TestSchedulerTickIntegration:
 
         await tick(deps)
 
-        rows, _ = await AuditRepo.list(deps.pools.api, campaign_id=cid, limit=50)
+        rows, _ = await query_audit(deps.pools.api, campaign_id=cid, limit=50)
         claimed = [r for r in rows if r.event_type == "CLAIMED" and r.call_id == calls[0]]
         dispatch = [r for r in rows if r.event_type == "DISPATCH" and r.call_id == calls[0]]
         assert len(claimed) == 1
@@ -646,12 +645,6 @@ class _UnavailableProvider:
 
     async def aclose(self) -> None:  # pragma: no cover
         return None
-
-
-# Quiet ruff: AuditEvent + SchedulerStateRepo imports are load-bearing despite
-# only appearing via the repositories' shape. These helpers use them
-# transitively through AuditRepo.list above.
-_ = (AuditEvent, SchedulerStateRepo)
 
 
 async def _count_audit(pool: asyncpg.Pool, event_type: str) -> int:

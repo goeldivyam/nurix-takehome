@@ -11,6 +11,7 @@ import asyncpg
 import pytest
 from testcontainers.postgres import PostgresContainer
 
+from app.state.campaign_terminal import maybe_promote_to_active
 from app.state.machine import TransitionResult, transition
 from app.state.types import CallStatus
 
@@ -205,6 +206,10 @@ class TestCampaignPromotion:
     async def test_first_queued_to_dialing_promotes_campaign_atomic(
         self, pool: asyncpg.Pool
     ) -> None:
+        # Mirrors the scheduler's Phase 1 contract: claim-equivalent
+        # transition + `maybe_promote_to_active` share ONE transaction on
+        # ONE connection, so a crash between commits can't leave the call
+        # DIALING under a PENDING campaign.
         campaign_id = await _seed_campaign(pool, status="PENDING")
         call_id = await _seed_call(pool, campaign_id, phone="+14155551001")
 
@@ -220,6 +225,7 @@ class TestCampaignPromotion:
                 reason="claim",
             )
             assert result.applied
+            await maybe_promote_to_active(conn, campaign_id)
 
         # Campaign was PENDING, now ACTIVE.
         assert await _campaign_status(pool, campaign_id) == "ACTIVE"
@@ -232,7 +238,8 @@ class TestCampaignPromotion:
         campaign_id = await _seed_campaign(pool, status="PENDING")
         call_id = await _seed_call(pool, campaign_id, phone="+14155551002")
 
-        # Open a transaction, run the transition, then raise to force rollback.
+        # Open a transaction, run the transition + promotion, then raise to
+        # force rollback. Mirrors tick's Phase 1 — both land or neither does.
         with pytest.raises(RuntimeError, match="forced rollback"):  # noqa: PT012
             async with pool.acquire() as conn, conn.transaction():
                 await transition(
@@ -245,6 +252,7 @@ class TestCampaignPromotion:
                     event_type="CLAIMED",
                     reason="claim",
                 )
+                await maybe_promote_to_active(conn, campaign_id)
                 raise RuntimeError("forced rollback")
 
         # Neither row persisted — both the call transition AND the campaign

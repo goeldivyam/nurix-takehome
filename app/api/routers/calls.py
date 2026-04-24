@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -39,13 +40,15 @@ def get_deps(request: Request) -> Deps:
     return deps
 
 
-# FastAPI's Depends/Query-in-default idiom is the framework's canonical
-# signature shape; B008 (do-not-call-in-defaults) is suppressed on each
-# parameter line rather than re-architecting away from the idiom.
+# Using the Annotated[..., Depends(...)] form keeps FastAPI's DI idiom
+# while avoiding the B008 "function call in default argument" lint.
+DepsDep = Annotated[Deps, Depends(get_deps)]
+
+
 @router.get("/calls/{call_id}", response_model=CallResponse)
 async def get_call(
     call_id: UUID,
-    deps: Deps = Depends(get_deps),  # noqa: B008
+    deps: DepsDep,
 ) -> CallResponse:
     async with deps.pools.api.acquire() as conn:
         row = await CallRepo.get(conn, call_id)
