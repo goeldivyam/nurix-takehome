@@ -53,6 +53,8 @@
       from_custom: "",
       to_custom: "",
       reason_contains: "",
+      phone: "",
+      call_id: "",
       cursor: null,
     },
     events: [],
@@ -80,6 +82,11 @@
     state.filters.from_custom = p.from_ts || "";
     state.filters.to_custom = p.to_ts || "";
     state.filters.reason_contains = p.reason || "";
+    // Phone URL param is digit-normalized on the backend; store whatever
+    // the share URL carried so the input can round-trip the typed shape
+    // if it's already digits, or just the sanitized digits otherwise.
+    state.filters.phone = p.phone ? String(p.phone) : "";
+    state.filters.call_id = p.call_id ? String(p.call_id) : "";
     state.filters.cursor = p.cursor || null;
   }
 
@@ -91,6 +98,8 @@
       from_ts: state.filters.range === "custom" ? state.filters.from_custom : "",
       to_ts: state.filters.range === "custom" ? state.filters.to_custom : "",
       reason: state.filters.reason_contains,
+      phone: state.filters.phone,
+      call_id: state.filters.call_id,
       cursor: state.filters.cursor || "",
     });
   }
@@ -134,10 +143,12 @@
       limit: 100,
       cursor: state.filters.cursor || undefined,
       campaign_id: state.filters.campaigns.length === 1 ? state.filters.campaigns[0] : undefined,
+      call_id: state.filters.call_id || undefined,
       event_type: state.filters.event_types.length ? state.filters.event_types : undefined,
       from_ts: from_ts || undefined,
       to_ts: to_ts || undefined,
       reason_contains: state.filters.reason_contains || undefined,
+      phone: state.filters.phone || undefined,
     };
     // The /audit endpoint currently accepts a single campaign_id. When the
     // operator selects multiple, we OR client-side after the fetch. A
@@ -258,6 +269,28 @@
     // Time range segmented
     bar.appendChild(buildTimeRange());
 
+    // Phone filter (left of reason: identity filters before content filters).
+    // Input accepts any shape; backend digit-normalises and requires ≥3
+    // digits before firing. Sub-threshold inputs are a silent no-op.
+    const phoneInput = el("input", {
+      id: "audit-phone",
+      type: "search",
+      class: "mono",
+      placeholder: "phone digits...",
+      value: state.filters.phone,
+      "aria-label": "Filter by phone (digits, minimum 3)",
+    });
+    phoneInput.addEventListener("input", () => {
+      if (state.phoneDebounceTimer) clearTimeout(state.phoneDebounceTimer);
+      state.phoneDebounceTimer = setTimeout(() => {
+        state.filters.phone = phoneInput.value;
+        state.filters.cursor = null;
+        writeFiltersToUrl();
+        fetchEvents();
+      }, 250);
+    });
+    bar.appendChild(phoneInput);
+
     // Reason filter
     const reasonInput = el("input", {
       id: "audit-reason",
@@ -277,6 +310,35 @@
       }, 250);
     });
     bar.appendChild(reasonInput);
+
+    // Active call_id filter — rendered as a dismissable chip so the
+    // operator always knows they're narrowed to one call's lifecycle
+    // (entered by clicking a call_id in any row). Dismissing returns to
+    // the broader view without touching the other filters.
+    if (state.filters.call_id) {
+      const callChip = el(
+        "button",
+        {
+          type: "button",
+          class: "filter-chip",
+          title: `Clear call filter (${state.filters.call_id})`,
+        },
+      );
+      callChip.appendChild(
+        el("span", { class: "filter-chip-label" }, "call:"),
+      );
+      callChip.appendChild(
+        el("span", { class: "filter-chip-value mono" }, state.filters.call_id.slice(0, 8) + "…"),
+      );
+      callChip.appendChild(el("span", { class: "filter-chip-x" }, "×"));
+      callChip.addEventListener("click", () => {
+        state.filters.call_id = "";
+        state.filters.cursor = null;
+        writeFiltersToUrl();
+        fetchEvents();
+      });
+      bar.appendChild(callChip);
+    }
 
     bar.appendChild(el("div", { class: "spacer" }));
 
@@ -563,6 +625,8 @@
         state.filters.from_custom = "";
         state.filters.to_custom = "";
         state.filters.reason_contains = "";
+        state.filters.phone = "";
+        state.filters.call_id = "";
         state.filters.cursor = null;
         writeFiltersToUrl();
         fetchEvents();
@@ -604,11 +668,62 @@
     } else {
       campaignCell.appendChild(el("span", { class: "mono", style: "color:var(--fg-subtle)" }, "—"));
     }
-    const callCell = el(
-      "td",
-      { class: "cell-call cell-mono", title: ev.call_id || "" },
-      ev.call_id ? ev.call_id.slice(0, 8) + "…" : "—"
-    );
+    // Call cell: phone (primary, clickable → filters audit to that phone)
+    // stacked above the short call_id (secondary, clickable → filters
+    // audit to that call_id's full lifecycle). Both click affordances
+    // are URL-backed so share-URLs round-trip. If the attempt_epoch is
+    // populated (call-scoped events), a subdued `attempt N` badge sits
+    // below the call_id. Campaign-level events render a single em-dash.
+    const callCell = el("td", { class: "cell-call cell-mono" });
+    if (ev.phone || ev.call_id) {
+      const stack = el("div", { class: "call-stack" });
+      if (ev.phone) {
+        const phoneLink = el(
+          "button",
+          {
+            type: "button",
+            class: "call-ident call-ident-primary",
+            title: `Filter audit by ${ev.phone}`,
+          },
+          ev.phone,
+        );
+        phoneLink.addEventListener("click", () => {
+          state.filters.phone = ev.phone;
+          state.filters.cursor = null;
+          writeFiltersToUrl();
+          fetchEvents();
+        });
+        stack.appendChild(phoneLink);
+      }
+      if (ev.call_id) {
+        const idLink = el(
+          "button",
+          {
+            type: "button",
+            class: "call-ident call-ident-secondary",
+            title: `Filter audit by call ${ev.call_id}`,
+          },
+          ev.call_id.slice(0, 8) + "…",
+        );
+        idLink.addEventListener("click", () => {
+          state.filters.call_id = ev.call_id;
+          state.filters.cursor = null;
+          writeFiltersToUrl();
+          fetchEvents();
+        });
+        stack.appendChild(idLink);
+      }
+      if (ev.attempt_epoch != null) {
+        stack.appendChild(
+          el("span", { class: "call-attempt" }, `attempt ${ev.attempt_epoch}`),
+        );
+      }
+      callCell.appendChild(stack);
+    } else {
+      callCell.appendChild(
+        el("span", { class: "mono", style: "color:var(--fg-subtle)" }, "—"),
+      );
+    }
     const eventCell = el("td", { class: "cell-event" });
     eventCell.appendChild(
       el(
@@ -733,11 +848,15 @@
     const bits = [];
     if (state.filters.campaigns.length > 0)
       bits.push(`${state.filters.campaigns.length} campaign(s)`);
+    if (state.filters.call_id)
+      bits.push(`call ${state.filters.call_id.slice(0, 8)}…`);
     if (state.filters.event_types.length > 0)
       bits.push(`events: ${state.filters.event_types.join(",")}`);
     bits.push(`range: ${state.filters.range}`);
     if (state.filters.reason_contains)
       bits.push(`reason~"${state.filters.reason_contains}"`);
+    if (state.filters.phone)
+      bits.push(`phone~"${state.filters.phone}"`);
     return bits.join(" · ");
   }
 

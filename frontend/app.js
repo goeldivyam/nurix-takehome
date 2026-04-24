@@ -14,8 +14,24 @@
 
   history.scrollRestoration = "manual";
 
+  // When the frontend is served from a separate origin (e.g. a static
+  // HTTP server on :5173 for LAN demos while the API runs on :8001),
+  // rewrite same-origin fetches to the API's absolute URL. The backend
+  // exposes a permissive CORS policy for exactly this local-dev case.
+  // The default (served by the FastAPI app itself at `/ui`) keeps the
+  // empty prefix so the UI continues to work when same-origin.
+  function _detectApiBase() {
+    if (typeof window === "undefined" || !window.location) return "";
+    const { protocol, hostname, port } = window.location;
+    const frontendOnlyPorts = new Set(["5173", "3000", "8080"]);
+    if (frontendOnlyPorts.has(port)) {
+      return `${protocol}//${hostname}:8001`;
+    }
+    return "";
+  }
+
   const App = (window.App = {
-    apiBase: "",
+    apiBase: _detectApiBase(),
     activeTab: "campaigns",
     campaignsCache: null,
     audit: {

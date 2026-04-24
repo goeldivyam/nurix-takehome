@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routers.audit import router as audit_router
@@ -106,6 +107,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Nurix Voice Campaign", version="0.1.0", lifespan=lifespan)
+
+# CORS for local-network frontend dev: the static frontend may be served
+# from a separate origin (e.g. a vanilla `python -m http.server 5173` on the
+# LAN at http://192.168.68.100:5173) while the API stays on :8001. Allow
+# any origin on the local network — this is a take-home service with no
+# authentication, so the trust model is "whoever can reach the API port
+# is authorized." A production deployment would switch to an allow-list of
+# known origins + auth headers; documented as README future-work.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(campaigns_router)
 app.include_router(calls_router)

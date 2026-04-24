@@ -257,7 +257,22 @@
     wrap.appendChild(control);
     if (hint) wrap.appendChild(el("div", { class: "hint" }, hint));
     const errText = state.errors && state.errors[errorKey];
-    if (errText) wrap.appendChild(el("div", { class: "err" }, errText));
+    if (errText) {
+      // role="alert" + aria-live="polite" so screen readers announce the
+      // validation failure when it lands, and so the audit + form share
+      // one error-disclosure vocabulary.
+      wrap.appendChild(
+        el(
+          "div",
+          {
+            class: "err",
+            role: "alert",
+            "aria-live": "polite",
+          },
+          errText,
+        ),
+      );
+    }
     return wrap;
   }
 
@@ -479,13 +494,23 @@
       return wrap;
     }
     const list = el("div", { class: "campaign-list" });
+    const formatStatus = window.App.format.campaignStatus;
     for (const c of state.list.campaigns) {
-      const row = el("div", { class: "campaign-row" });
+      // Row is a <button> so it's natively click+keyboard reachable;
+      // `all: unset` in CSS strips the default chrome so it still reads
+      // as a row. Clicking opens the read-only detail drawer with config
+      // + stats + a live list of this campaign's calls.
+      const row = el("button", {
+        type: "button",
+        class: "campaign-row",
+        "aria-label": `Open campaign details for ${c.name}`,
+      });
       row.appendChild(el("div", { class: "name" }, c.name));
+      const { cssClass, label } = formatStatus(c.status);
       const badge = el(
         "span",
-        { class: `status-badge status-${c.status}` },
-        c.status
+        { class: `status-badge ${cssClass}` },
+        label
       );
       row.appendChild(badge);
       row.appendChild(
@@ -495,9 +520,264 @@
           formatTs(c.created_at, { date: true })
         )
       );
+      row.addEventListener("click", () => openCampaignDrawer(c));
       list.appendChild(row);
     }
     wrap.appendChild(list);
+    return wrap;
+  }
+
+  /* ------------ Campaign detail drawer (read-only) ------------ */
+
+  async function openCampaignDrawer(campaign) {
+    // Mount an aside-drawer that overlays the right side; close via X button
+    // or click outside. Async-load stats + calls list after paint so the
+    // drawer opens immediately with the static setup and fills in the rest.
+    closeCampaignDrawer();
+    const backdrop = el("div", {
+      class: "drawer-backdrop",
+      id: "campaign-drawer-backdrop",
+    });
+    backdrop.addEventListener("click", (e) => {
+      if (e.target === backdrop) closeCampaignDrawer();
+    });
+    // Remember the trigger so focus can return on close (WCAG 2.4.3).
+    const returnFocusTo = document.activeElement;
+    // Unique id for `aria-labelledby` wiring to the drawer title.
+    const titleId = `drawer-title-${campaign.id}`;
+    const drawer = el("aside", {
+      class: "campaign-drawer",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-labelledby": titleId,
+    });
+    const close = el(
+      "button",
+      {
+        type: "button",
+        class: "drawer-close",
+        "aria-label": "Close details",
+      },
+      "×",
+    );
+    close.addEventListener("click", closeCampaignDrawer);
+    drawer.appendChild(close);
+
+    drawer.appendChild(renderDrawerHeader(campaign, titleId));
+    drawer.appendChild(renderDrawerSetup(campaign));
+
+    const statsSlot = el("section", { class: "drawer-section" });
+    statsSlot.appendChild(el("h3", { class: "drawer-heading" }, "Stats"));
+    const statsBody = el("div", { class: "drawer-stats-body" }, "Loading…");
+    statsSlot.appendChild(statsBody);
+    drawer.appendChild(statsSlot);
+
+    const callsSlot = el("section", { class: "drawer-section" });
+    callsSlot.appendChild(el("h3", { class: "drawer-heading" }, "Calls"));
+    const callsBody = el("div", { class: "drawer-calls-body" }, "Loading…");
+    callsSlot.appendChild(callsBody);
+    drawer.appendChild(callsSlot);
+
+    backdrop.appendChild(drawer);
+    document.body.appendChild(backdrop);
+    document.body.classList.add("drawer-open");
+
+    // Move focus into the dialog (WCAG 2.4.11 / ARIA dialog pattern).
+    // The close button is the least-disruptive landing target: a keyboard
+    // user can Tab forward into the drawer body or Escape out immediately.
+    close.focus();
+
+    // Escape to close + Tab focus-trap so a keyboard user can't silently
+    // fall back to the page behind the backdrop. Scoped listener; the
+    // closer removes it so repeated open/close doesn't leak handlers.
+    const focusableSelector =
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const keyHandler = (e) => {
+      if (e.key === "Escape") {
+        closeCampaignDrawer();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const focusable = drawer.querySelectorAll(focusableSelector);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", keyHandler);
+    backdrop._keyHandler = keyHandler;
+    backdrop._returnFocusTo = returnFocusTo;
+
+    // Fire the two fetches in parallel so total drawer-open latency is one
+    // round-trip, not two.
+    Promise.all([
+      window.App.api.get(`/campaigns/${campaign.id}/stats`).catch(() => null),
+      window.App.api.get(`/campaigns/${campaign.id}/calls`, { limit: 50 }).catch(() => null),
+    ]).then(([stats, calls]) => {
+      statsBody.textContent = "";
+      if (stats) statsBody.appendChild(renderDrawerStats(stats));
+      else statsBody.textContent = "Failed to load stats.";
+      callsBody.textContent = "";
+      if (calls) callsBody.appendChild(renderDrawerCalls(calls, campaign));
+      else callsBody.textContent = "Failed to load calls.";
+    });
+  }
+
+  function closeCampaignDrawer() {
+    const existing = document.getElementById("campaign-drawer-backdrop");
+    if (!existing) return;
+    if (existing._keyHandler) window.removeEventListener("keydown", existing._keyHandler);
+    const returnTo = existing._returnFocusTo;
+    existing.remove();
+    document.body.classList.remove("drawer-open");
+    // Return focus to the element that opened the drawer so keyboard
+    // users don't get dumped at the top of the page.
+    if (returnTo && typeof returnTo.focus === "function") {
+      returnTo.focus();
+    }
+  }
+
+  function renderDrawerHeader(c, titleId) {
+    const header = el("header", { class: "drawer-header" });
+    header.appendChild(el("h2", { class: "drawer-title", id: titleId }, c.name));
+    const formatStatus = window.App.format.campaignStatus;
+    const { cssClass, label } = formatStatus(c.status);
+    header.appendChild(
+      el("span", { class: `status-badge ${cssClass}` }, label),
+    );
+    return header;
+  }
+
+  function renderDrawerSetup(c) {
+    const section = el("section", { class: "drawer-section" });
+    section.appendChild(el("h3", { class: "drawer-heading" }, "Setup"));
+    const dl = el("dl", { class: "drawer-dl" });
+    const addRow = (label, value) => {
+      dl.appendChild(el("dt", {}, label));
+      dl.appendChild(el("dd", { class: "mono" }, value));
+    };
+    addRow("Timezone", c.timezone);
+    addRow("Max concurrent", String(c.max_concurrent));
+    addRow(
+      "Retry policy",
+      `${c.retry_config.max_attempts} attempt(s), base ${c.retry_config.backoff_base_seconds}s, ±20% jitter`,
+    );
+    addRow("Created", formatTs(c.created_at, { date: true }));
+    addRow("Updated", formatTs(c.updated_at, { date: true }));
+    section.appendChild(dl);
+
+    // Weekly schedule: one line per day with its configured windows, or
+    // an em-dash if that day is closed. Read-only rendering; no edits.
+    const schedHeading = el("h4", { class: "drawer-subheading" }, "Weekly schedule");
+    section.appendChild(schedHeading);
+    const schedList = el("ul", { class: "drawer-schedule" });
+    const days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    for (const day of days) {
+      const windows = c.schedule[day] || [];
+      const line = el("li", {});
+      line.appendChild(el("span", { class: "drawer-day" }, day.toUpperCase()));
+      if (windows.length === 0) {
+        line.appendChild(el("span", { class: "drawer-windows dim" }, "—"));
+      } else {
+        const text = windows.map((w) => `${w.start}–${w.end}`).join(", ");
+        line.appendChild(el("span", { class: "drawer-windows mono" }, text));
+      }
+      schedList.appendChild(line);
+    }
+    section.appendChild(schedList);
+    return section;
+  }
+
+  function renderDrawerStats(stats) {
+    const grid = el("div", { class: "drawer-stats-grid" });
+    const cell = (label, value) => {
+      const c = el("div", { class: "drawer-stat" });
+      c.appendChild(el("div", { class: "drawer-stat-value mono" }, String(value)));
+      c.appendChild(el("div", { class: "drawer-stat-label" }, label));
+      return c;
+    };
+    grid.appendChild(cell("Total", stats.total));
+    grid.appendChild(cell("Completed", stats.completed));
+    grid.appendChild(cell("Failed", stats.failed));
+    grid.appendChild(cell("In progress", stats.in_progress));
+    grid.appendChild(cell("Retries", stats.retries_attempted));
+    return grid;
+  }
+
+  function renderDrawerCalls(payload, campaign) {
+    const calls = payload.calls || [];
+    const wrap = el("div");
+    if (calls.length === 0) {
+      wrap.appendChild(
+        el("div", { class: "drawer-empty" }, "No calls in this campaign yet."),
+      );
+      return wrap;
+    }
+    const table = el("table", { class: "drawer-table" });
+    const head = el("tr");
+    ["phone", "status", "attempt", "updated", ""].forEach((h) =>
+      head.appendChild(el("th", {}, h)),
+    );
+    const thead = el("thead");
+    thead.appendChild(head);
+    table.appendChild(thead);
+    const tbody = el("tbody");
+    for (const call of calls) {
+      const tr = el("tr");
+      tr.appendChild(el("td", { class: "mono" }, call.phone));
+      tr.appendChild(
+        el("td", { class: `call-status-cell call-status-${call.status}` }, call.status),
+      );
+      tr.appendChild(
+        el("td", { class: "mono" }, String(call.attempt_epoch)),
+      );
+      tr.appendChild(
+        el("td", { class: "mono dim" }, formatTs(call.updated_at, { date: true })),
+      );
+      // Deep-link: clicking "View" switches to the Audit tab with a
+      // filter pre-applied to this call_id so the operator lands on
+      // the call's full lifecycle in one click.
+      const view = el(
+        "button",
+        {
+          type: "button",
+          class: "ghost drawer-call-view",
+          title: `View this call's lifecycle in the audit tab`,
+        },
+        "View →",
+      );
+      view.addEventListener("click", () => {
+        const params = new URLSearchParams();
+        params.set("call_id", call.id);
+        params.set("campaign_id", campaign.id);
+        params.set("range", "24h");
+        const nextUrl = `${window.location.pathname}?${params.toString()}#audit`;
+        history.pushState(null, "", nextUrl);
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+        closeCampaignDrawer();
+      });
+      const actions = el("td", {});
+      actions.appendChild(view);
+      tr.appendChild(actions);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    if (payload.next_cursor) {
+      wrap.appendChild(
+        el(
+          "div",
+          { class: "drawer-pager-hint dim" },
+          "Showing first 50 — use the Audit tab for older events.",
+        ),
+      );
+    }
     return wrap;
   }
 
