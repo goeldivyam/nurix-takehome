@@ -85,9 +85,11 @@ Full DDL lives in `schema.sql`.
 
 ## How the scheduler works
 
-**The loop.** Wait for a wake signal (or a safety-net timeout), clear the flag, run one tick, repeat. Clearing *before* the tick — not after — means a wake arriving during a tick is captured for the next iteration. No lost wakeups.
+**The wake signal.** An `asyncio.Event` held inside the FastAPI process. Whenever a call reaches a terminal status — a webhook arrives, a dial-time provider rejection lands, or the reclaim sweep resolves a stuck row — the state machine calls `event.set()`. The scheduler is parked on `await event.wait()` and resumes within microseconds. That's continuous channel reuse.
 
-**The wake signal.** The state machine and webhook processor call `wake.notify()` after every terminal transition. That's what delivers continuous channel reuse: the scheduler reacts to completions in milliseconds, not batches.
+**The safety-net timer.** A ~1-second fallback that wakes the scheduler even if no event is set. Two jobs: time-triggered work that nobody fires a wake for (a retry's backoff elapsing, a business-hour window opening), and a guarantee that the scheduler still runs if a wake is ever lost.
+
+**The loop.** Wait for either the wake signal or the safety-net timer, lower the flag, run one tick. Lowering the flag **before** the tick is the important bit: if a wake comes in while the tick is running, the flag goes back up and the next `wait()` returns immediately. If we lowered it after, that mid-tick wake would be erased — and the completion it announced would wait for the safety-net timer.
 
 **One tick.**
 
