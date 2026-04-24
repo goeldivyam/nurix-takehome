@@ -134,7 +134,7 @@ Calls retry on outcomes that might succeed on redial; they fail hard on outcomes
 - **Horizontal replicas.** Run N app containers against one shared Postgres. All replicas see all campaigns — there's no partitioning. Each replica runs its own scheduler loop and races to claim work from the shared `calls` table; `SELECT … FOR UPDATE SKIP LOCKED` ensures no two replicas dial the same row. Work spreads naturally across replicas.
 - **One gap** in the multi-replica story: the scheduler checks `max_concurrent` by counting in-flight calls, then claiming. In a single process that's race-free. In multi-replica, two ticks can count at the same moment, both decide "one slot left," and both claim — briefly exceeding the cap. Fix (future work): wrap the count + claim in a per-campaign advisory lock so only one replica counts-and-claims for a given campaign at a time.
 - **Pool separation.** Three asyncpg pools (api / scheduler / webhook) so a webhook burst or a long audit scan can't starve the scheduler. Sizes are env-driven so each role can be tuned independently.
-- **Cursor-based pagination.** `/audit` and `/campaigns` use keyset pagination, so new rows arriving mid-scan don't shift pages.
+- **Cursor-based pagination.** Each page is fetched by "give me the next batch after this marker (timestamp, id)" rather than "skip N rows." Two wins: new rows arriving while you paginate don't shift existing pages, and performance stays flat as the audit log grows (no `OFFSET` scan penalty).
 
 ---
 
