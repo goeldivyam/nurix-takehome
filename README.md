@@ -28,7 +28,7 @@ All of the following run inside **one FastAPI process** sharing **one asyncio ev
 
 **Audit log.** Append-only table of every decision, skip, transition, and webhook outcome. **The audit log is the visualization** — the `/ui` page is a filterable, paginated view over it.
 
-**Mock provider.** Stands in for Twilio. Implements `place_call` (accepts the dial, returns a handle) and `get_status` (used by the reclaim sweep). At dispatch it pre-rolls the outcome and fires simulated events on a timer:
+**Mock provider.** Stands in for Twilio. Implements `place_call` (accepts the dial, returns a handle) and `get_status` (used by the reclaim sweep). It plays two roles at once: the outbound adapter behind the Dialer interface, and the external provider that pushes events to the listener — a job that in production belongs to Twilio itself, not to the adapter. At dispatch it pre-rolls the outcome and fires simulated events on a timer:
 - *Happy path:* `DIALING` → sleep → `IN_PROGRESS` → sleep → `COMPLETED` (full duration).
 - *Failure paths:* `DIALING` → sleep → terminal (`FAILED` / `NO_ANSWER`), skipping `IN_PROGRESS`.
 - *Fixed timing* — 3s per call by default, 15s in demo mode. No jitter.
@@ -39,28 +39,34 @@ All of the following run inside **one FastAPI process** sharing **one asyncio ev
 ## Architecture
 
 ```
- Browser
-    │
-    │ HTTP
-    ▼
- ┌─ FastAPI process ─────────────────────────────────┐
- │  (one asyncio event loop)                         │
- │                                                   │
- │    HTTP routes  ─────┐                            │
- │    Scheduler loop  ──┤                            │
- │    Webhook proc.   ──┼──▶  State machine          │
- │    Reclaim sweep   ──┘         │                  │
- │                                │                  │
- │    Dialer (port)  ──▶  Mock provider              │
- │         ▲                  │                      │
- │         │  simulated events│                      │
- │         └──────────────────┘                      │
- └──────────────────────┬────────────────────────────┘
-                        │ asyncpg
-                        ▼
-                    Postgres
-        (campaigns, calls, scheduler_audit,
-         webhook_inbox, scheduler_campaign_state)
+  Browser                                  Provider push
+     │                             (mock simulates in-process)
+     │ HTTP                                     │
+     ▼                                          ▼
+ ┌─ FastAPI process (one asyncio event loop) ────────────┐
+ │                                                       │
+ │   API routes              Webhook listener            │
+ │       │                          │                    │
+ │       │                          ▼                    │
+ │       │                  (writes inbox row)           │
+ │       │                                               │
+ │       ▼                                               │
+ │   State machine (sole mutator; paired audit row)      │
+ │       ▲        ▲        ▲                             │
+ │       │        │        │                             │
+ │   Scheduler  Webhook  Reclaim                         │
+ │    loop      proc.    sweep                           │
+ │       │                   │                           │
+ │       └─────────┬─────────┘                           │
+ │                 ▼                                     │
+ │         Dialer (mock provider)                        │
+ │                                                       │
+ └───────────────────────┬───────────────────────────────┘
+                         │ asyncpg
+                         ▼
+                      Postgres
+          (campaigns, calls, scheduler_audit,
+           webhook_inbox, scheduler_campaign_state)
 ```
 
 ---
