@@ -255,14 +255,22 @@ class CampaignRepo:
     async def list_eligible_for_tick(
         conn: asyncpg.Connection,
     ) -> list[CampaignRowWithCursor]:
-        # `EXISTS (...)` narrows the set to campaigns with at least one live
-        # (non-terminal) call. Without this, a campaign whose calls have all
-        # finished but whose own rollup hasn't fired yet — or a PENDING
-        # campaign seeded with zero calls — would be returned every tick and
-        # emit noise (SKIP_BUSINESS_HOUR / SKIP_CONCURRENCY rows about nothing)
-        # into the audit log. A business-hour-closed campaign with QUEUED
-        # calls still appears (it has work), so its SKIP_BUSINESS_HOUR rows
-        # are preserved as actionable forensic evidence.
+        # `EXISTS (...)` narrows the set to campaigns with DISPATCHABLE work —
+        # i.e. at least one call in `QUEUED` (ready to claim) or `RETRY_PENDING`
+        # (eventually reclaimable by the retry sweep). DIALING / IN_PROGRESS
+        # rows are deliberately excluded: they represent calls already handed
+        # to the provider, not work for the scheduler's tick to act on. A
+        # campaign whose only live calls are in-flight will naturally reappear
+        # in the eligibility set the moment any of those calls transitions to
+        # a terminal state that produces a new RETRY_PENDING — otherwise the
+        # campaign has no further scheduler work and should not consume a tick
+        # slot. This also stops vacuous `SKIP_CONCURRENCY` rows from accumulating
+        # every tick while a capped campaign's in-flight calls run (the skip
+        # row is only load-bearing forensic signal when a dispatchable row is
+        # actually being held back by the cap — see the retry-pending-but-capped
+        # case, which IS still covered because RETRY_PENDING stays in the set).
+        # Business-hour gate remains observable: a campaign outside hours with
+        # QUEUED work still appears here and emits `SKIP_BUSINESS_HOUR` per tick.
         rows = await conn.fetch(
             """
             SELECT c.id, c.name, c.status, c.timezone, c.schedule,
@@ -274,7 +282,7 @@ class CampaignRepo:
               AND EXISTS (
                   SELECT 1 FROM calls
                   WHERE campaign_id = c.id
-                    AND status IN ('QUEUED', 'DIALING', 'IN_PROGRESS', 'RETRY_PENDING')
+                    AND status IN ('QUEUED', 'RETRY_PENDING')
               )
             ORDER BY c.id ASC
             """

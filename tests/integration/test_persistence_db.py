@@ -205,6 +205,62 @@ class TestCampaignRepo:
         assert all_terminal_id not in ids
         assert no_calls_id not in ids
 
+    async def test_list_eligible_for_tick_excludes_in_flight_only_campaigns(
+        self, pool: asyncpg.Pool
+    ) -> None:
+        # DIALING / IN_PROGRESS rows represent work already handed to the
+        # provider — they're not dispatchable by the scheduler's tick. A
+        # campaign whose ONLY live calls are in-flight must therefore drop
+        # out of eligibility; otherwise the scheduler evaluates it every
+        # tick, the concurrency gate filters it, and the audit fills with
+        # vacuous SKIP_CONCURRENCY rows. The inverse — a campaign with a
+        # DIALING call AND a QUEUED or RETRY_PENDING call — MUST remain
+        # eligible because there is genuinely dispatchable work waiting.
+        dialing_only_id = await _create_campaign(pool, name="dialing-only")
+        dialing_plus_queued_id = await _create_campaign(pool, name="dialing-plus-queued")
+        dialing_plus_retry_id = await _create_campaign(pool, name="dialing-plus-retry")
+        async with pool.acquire() as conn:
+            dialing_only_calls = await CallRepo.create_batch(
+                conn,
+                campaign_id=dialing_only_id,
+                phones=["+14155550301"],
+                retries_remaining=0,
+            )
+            await conn.execute(
+                "UPDATE calls SET status = 'DIALING' WHERE id = $1",
+                dialing_only_calls[0],
+            )
+            mixed_calls = await CallRepo.create_batch(
+                conn,
+                campaign_id=dialing_plus_queued_id,
+                phones=["+14155550302", "+14155550303"],
+                retries_remaining=0,
+            )
+            await conn.execute(
+                "UPDATE calls SET status = 'DIALING' WHERE id = $1",
+                mixed_calls[0],
+            )
+            # mixed_calls[1] stays QUEUED by default.
+            retry_mix_calls = await CallRepo.create_batch(
+                conn,
+                campaign_id=dialing_plus_retry_id,
+                phones=["+14155550304", "+14155550305"],
+                retries_remaining=1,
+            )
+            await conn.execute(
+                "UPDATE calls SET status = 'DIALING' WHERE id = $1",
+                retry_mix_calls[0],
+            )
+            await conn.execute(
+                "UPDATE calls SET status = 'RETRY_PENDING', next_attempt_at = NOW() WHERE id = $1",
+                retry_mix_calls[1],
+            )
+            rows = await CampaignRepo.list_eligible_for_tick(conn)
+        ids = {r.id for r in rows}
+        assert dialing_only_id not in ids
+        assert dialing_plus_queued_id in ids
+        assert dialing_plus_retry_id in ids
+
     async def test_stats_matches_hand_counts(self, pool: asyncpg.Pool) -> None:
         campaign_id = await _create_campaign(pool)
         async with pool.acquire() as conn:
