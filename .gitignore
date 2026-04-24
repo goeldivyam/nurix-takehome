@@ -60,7 +60,9 @@ _test_*
 !docs/*.md
 !.claude/agents/*.md
 !.claude/skills/**/SKILL.md
-!.claude/agent-memory/**/*.md
+
+# Agent memory — local to each dev machine; never ship to remote.
+.claude/agent-memory/
 
 # Playwright MCP transcripts + local screenshots
 .playwright-mcp/

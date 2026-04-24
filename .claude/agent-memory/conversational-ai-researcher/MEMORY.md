@@ -1,2 +1,0 @@
-- [Nurix take-home scope and rubric](project_nurix_takehome.md) — local-only outbound voice campaign service, Mohit's 8-point rubric, simple-over-engineered principle.
-- [Canonical voice-AI and queue sources](reference_production_sources.md) — verified links for SKIP LOCKED, Twilio/Retell webhooks, Pipecat/LiveKit transports, DRR paper.

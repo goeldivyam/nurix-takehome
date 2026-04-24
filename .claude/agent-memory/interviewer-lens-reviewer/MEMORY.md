@@ -1,3 +1,0 @@
-- [Candidate profile](user_candidate.md) — Divyam Goel, IIT-B '12, ex-MSFT/Uber/Google, founder AttainU/TaskHarmony; principal-level bar
-- [V2 design snapshot](project_v2_frozen.md) — frozen-after-round-1 design cross-reviewed by 4 sister agents; defense-ready verdict
-- [Recurring weak spots](project_recurring_weak_spots.md) — gaps to re-check on every future iteration
