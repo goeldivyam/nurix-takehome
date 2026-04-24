@@ -70,7 +70,23 @@
     allCampaigns: [],
     campaignSearch: "",
     expandedReasons: new Set(),
+    // In-memory stack of cursors that led to the current page. Pushed on
+    // every "Older →" click; popped by "← Newer". Keyset pagination is
+    // forward-only in the backend; this stack gives the UI one-page-back
+    // navigation without a reverse-cursor API. Refresh resets the stack
+    // (the stack isn't URL-encoded) — after refresh the operator is back
+    // on whatever cursor page is in the URL, with no Newer-walk history.
+    pageHistory: [],
   };
+
+  // Any filter change invalidates the cursor + the pageHistory: the
+  // cursor was computed against the previous filter set, so both
+  // "← Newer" and continuing "Older →" would land on rows that don't
+  // match the new filters. Callers that mutate a filter invoke this.
+  function resetPagination() {
+    state.filters.cursor = null;
+    state.pageHistory = [];
+  }
 
   /* ---------------- URL <-> filter state ---------------- */
 
@@ -284,7 +300,7 @@
       if (state.phoneDebounceTimer) clearTimeout(state.phoneDebounceTimer);
       state.phoneDebounceTimer = setTimeout(() => {
         state.filters.phone = phoneInput.value;
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       }, 250);
@@ -304,7 +320,7 @@
       if (state.reasonDebounceTimer) clearTimeout(state.reasonDebounceTimer);
       state.reasonDebounceTimer = setTimeout(() => {
         state.filters.reason_contains = reasonInput.value;
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       }, 250);
@@ -333,7 +349,7 @@
       callChip.appendChild(el("span", { class: "filter-chip-x" }, "×"));
       callChip.addEventListener("click", () => {
         state.filters.call_id = "";
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       });
@@ -423,7 +439,7 @@
         } else {
           state.filters.campaigns = state.filters.campaigns.filter((x) => x !== c.id);
         }
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       });
@@ -487,7 +503,7 @@
           if (cb.checked) state.filters.event_types = [...state.filters.event_types, name];
           else
             state.filters.event_types = state.filters.event_types.filter((x) => x !== name);
-          state.filters.cursor = null;
+          resetPagination();
           writeFiltersToUrl();
           fetchEvents();
         });
@@ -514,7 +530,7 @@
       );
       b.addEventListener("click", () => {
         state.filters.range = r.key;
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       });
@@ -533,13 +549,13 @@
       });
       from.addEventListener("change", () => {
         state.filters.from_custom = from.value;
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       });
       to.addEventListener("change", () => {
         state.filters.to_custom = to.value;
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       });
@@ -627,7 +643,7 @@
         state.filters.reason_contains = "";
         state.filters.phone = "";
         state.filters.call_id = "";
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
       });
@@ -689,7 +705,7 @@
         );
         phoneLink.addEventListener("click", () => {
           state.filters.phone = ev.phone;
-          state.filters.cursor = null;
+          resetPagination();
           writeFiltersToUrl();
           fetchEvents();
         });
@@ -707,7 +723,7 @@
         );
         idLink.addEventListener("click", () => {
           state.filters.call_id = ev.call_id;
-          state.filters.cursor = null;
+          resetPagination();
           writeFiltersToUrl();
           fetchEvents();
         });
@@ -815,10 +831,27 @@
 
   function buildPagination() {
     const wrap = el("div", { class: "pagination" });
+    // Layout: [← Newer]   [Back to latest]   [Older →]
+    // Newer appears only when we have in-memory page history. "Back to
+    // latest" remains as a one-click jump to the head regardless of depth.
+    if (state.pageHistory.length > 0) {
+      const prev = el("button", { type: "button" }, "← Newer");
+      prev.addEventListener("click", () => {
+        // Pop the cursor that led to the previous page and navigate back
+        // to it. `state.pageHistory` holds cursors of prior pages, not
+        // including the current one.
+        const previousCursor = state.pageHistory.pop();
+        state.filters.cursor = previousCursor ?? null;
+        writeFiltersToUrl();
+        fetchEvents();
+        reevaluatePolling();
+      });
+      wrap.appendChild(prev);
+    }
     if (state.filters.cursor) {
       const back = el("button", { type: "button", class: "ghost" }, "Back to latest");
       back.addEventListener("click", () => {
-        state.filters.cursor = null;
+        resetPagination();
         writeFiltersToUrl();
         fetchEvents();
         reevaluatePolling();
@@ -828,6 +861,9 @@
     if (state.nextCursor) {
       const next = el("button", { type: "button" }, "Older →");
       next.addEventListener("click", () => {
+        // Remember the current page's cursor so "← Newer" can return
+        // here. `null` is a valid entry — it represents the latest page.
+        state.pageHistory.push(state.filters.cursor);
         state.filters.cursor = state.nextCursor;
         writeFiltersToUrl();
         fetchEvents();
