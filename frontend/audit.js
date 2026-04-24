@@ -20,7 +20,6 @@
       items: [
         "SKIP_CONCURRENCY",
         "SKIP_BUSINESS_HOUR",
-        "SKIP_RETRY_BACKOFF",
         "WEBHOOK_IGNORED_STALE",
         "DEBUG_AGE_DIALING",
       ],
@@ -35,7 +34,6 @@
       color: "success",
       items: ["CAMPAIGN_COMPLETED", "CAMPAIGN_PROMOTED_ACTIVE"],
     },
-    { group: "Webhook", color: "fg-muted", items: ["WEBHOOK_RECEIVED"] },
     { group: "State", color: "fg", items: ["TRANSITION"] },
   ];
 
@@ -156,6 +154,13 @@
       state.nextCursor = res.next_cursor || null;
       state.total = events.length;
       state.loading = false;
+      // Ensure every campaign_id referenced by the fresh events has a known
+      // name; if any are missing (new campaign created since we last synced),
+      // re-fetch before we render — otherwise chips render as UUID slices.
+      const ids = Array.from(
+        new Set(events.map((e) => e.campaign_id).filter((x) => x)),
+      );
+      await ensureCampaignsLoaded(ids);
       render();
     } catch (err) {
       if (token !== state.fetchToken) return;
@@ -167,18 +172,32 @@
     }
   }
 
-  async function ensureCampaignsLoaded() {
-    if (state.allCampaigns.length > 0) return;
-    if (window.App.campaignsCache && window.App.campaignsCache.length > 0) {
-      state.allCampaigns = window.App.campaignsCache.slice();
-      return;
+  async function ensureCampaignsLoaded(requiredIds) {
+    // Previous behavior short-circuited whenever `allCampaigns.length > 0`,
+    // so a later POST /campaigns never propagated here and every new
+    // campaign's rows rendered as 8-char UUID slices. The contract is now
+    // "make sure we have a name for every id we're about to render" —
+    // if ANY required id is missing, re-fetch.
+    const haveIds = new Set(state.allCampaigns.map((c) => c.id));
+    const needFetch =
+      state.allCampaigns.length === 0 ||
+      (Array.isArray(requiredIds) && requiredIds.some((id) => id && !haveIds.has(id)));
+    if (!needFetch) return;
+    // Adopt the campaigns-tab cache if it's ahead of ours.
+    const fromTab = window.App.campaignsCache;
+    if (Array.isArray(fromTab) && fromTab.length >= state.allCampaigns.length) {
+      state.allCampaigns = fromTab.slice();
+      const updatedIds = new Set(state.allCampaigns.map((c) => c.id));
+      if (Array.isArray(requiredIds) && requiredIds.every((id) => !id || updatedIds.has(id))) {
+        return;
+      }
     }
     try {
       const res = await window.App.api.get("/campaigns", { limit: 200 });
       state.allCampaigns = res.campaigns || [];
       window.App.campaignsCache = state.allCampaigns;
     } catch (_) {
-      state.allCampaigns = [];
+      // Leave allCampaigns as-is; labels fall back to short-id.
     }
   }
 
@@ -213,6 +232,16 @@
     host.appendChild(buildLoadingBar());
     if (state.error) host.appendChild(buildErrorBanner());
     if (state.pins.length > 0) host.appendChild(buildPinStrip());
+    // Mirror the pager above the table so an operator reviewing a long
+    // page doesn't need to scroll 4300px to reach the next-page control.
+    // Only render when there's state to page over. The top copy is marked
+    // aria-hidden so screen readers read the control pair exactly once —
+    // the bottom pager carries the canonical a11y tree.
+    if (state.filters.cursor || state.nextCursor) {
+      const top = buildPagination();
+      top.setAttribute("aria-hidden", "true");
+      host.appendChild(top);
+    }
     host.appendChild(buildTable());
     host.appendChild(buildPagination());
   }
@@ -481,13 +510,28 @@
   }
 
   function buildPinStrip() {
-    const wrap = el("div", { class: "pinned-strip", role: "region", "aria-label": "Pinned events" });
+    // Pinned rows share the exact column widths / cell classes of the live
+    // audit table, so the pin strip reads as a sibling row stream rather
+    // than a floating snippet. Wrapping the rows in a real <table>/<tbody>
+    // keeps the <tr> + <td> markup semantically valid (raw <tr> in a <div>
+    // collapses cells into inline text in every browser).
+    const wrap = el("div", {
+      class: "pinned-strip",
+      role: "region",
+      "aria-label": "Pinned events",
+    });
     wrap.appendChild(
-      el("div", { class: "micro-caps", style: "margin-bottom:6px" }, `Pinned · ${state.pins.length}/5`)
+      el(
+        "div",
+        { class: "micro-caps", style: "margin-bottom:6px" },
+        `Pinned · ${state.pins.length}/5`,
+      ),
     );
-    for (const ev of state.pins) {
-      wrap.appendChild(renderRow(ev, { pinned: true }));
-    }
+    const table = el("table", { class: "table pinned-table" });
+    const tbody = el("tbody");
+    for (const ev of state.pins) tbody.appendChild(renderRow(ev, { pinned: true }));
+    table.appendChild(tbody);
+    wrap.appendChild(table);
     return wrap;
   }
 
@@ -594,39 +638,45 @@
       }
     });
     reasonCell.appendChild(reason);
-    tr.appendChild(tsCell);
-    tr.appendChild(campaignCell);
-    tr.appendChild(callCell);
-    tr.appendChild(eventCell);
-    tr.appendChild(reasonCell);
-
+    // Pin / unpin control rides inside the reason cell as an absolutely
+    // positioned overlay so it shares column space with the reason payload
+    // rather than consuming a dedicated 6th column (which at table-layout:
+    // fixed would claim ~50% of the reason column's width for an element
+    // invisible until hover).
     if (pinned) {
-      const dismiss = el("button", { class: "dismiss", type: "button", "aria-label": "Unpin" }, "x");
+      const dismiss = el(
+        "button",
+        { class: "row-action dismiss", type: "button", "aria-label": "Unpin" },
+        "×",
+      );
       dismiss.addEventListener("click", () => {
         state.pins = state.pins.filter((p) => p.id !== ev.id);
         render();
       });
-      const dismissCell = el("td", {}, "");
-      dismissCell.appendChild(dismiss);
-      tr.appendChild(dismissCell);
+      reasonCell.appendChild(dismiss);
     } else {
-      const pinCell = el("td", {});
       const pinBtn = el(
         "button",
         {
-          class: "row-pin-btn",
+          class: "row-action row-pin-btn",
           type: "button",
           "aria-label": "Pin event",
+          title: "Pin",
         },
-        "pin"
+        "Pin",
       );
       pinBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         pinEvent(ev);
       });
-      pinCell.appendChild(pinBtn);
-      tr.appendChild(pinCell);
+      reasonCell.appendChild(pinBtn);
     }
+
+    tr.appendChild(tsCell);
+    tr.appendChild(campaignCell);
+    tr.appendChild(callCell);
+    tr.appendChild(eventCell);
+    tr.appendChild(reasonCell);
     return tr;
   }
 

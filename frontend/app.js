@@ -95,9 +95,21 @@
   /* -------- URL state -------- */
 
   App.readParams = function readParams() {
-    const qs = new URLSearchParams(window.location.search);
+    // Accept both `/ui/?foo=bar#audit` (canonical) and `/ui/#audit?foo=bar`
+    // (what operators sometimes type). The audit-view URLs demo scripts
+    // emit use the canonical form; this tolerance keeps older links and
+    // hand-typed fragments working without rewriting history.
+    const search = new URLSearchParams(window.location.search);
+    const hash = window.location.hash || "";
+    const qIdx = hash.indexOf("?");
+    if (qIdx !== -1) {
+      const fromHash = new URLSearchParams(hash.slice(qIdx + 1));
+      for (const [k, v] of fromHash.entries()) {
+        if (!search.has(k)) search.set(k, v);
+      }
+    }
     const out = {};
-    for (const [k, v] of qs.entries()) out[k] = v;
+    for (const [k, v] of search.entries()) out[k] = v;
     return out;
   };
 
@@ -121,8 +133,12 @@
   /* -------- Tab routing -------- */
 
   function readTabFromHash() {
+    // Hash may be `#audit` (canonical), `#campaigns`, or — for the
+    // legacy/typed form — `#audit?event_type=...`. Strip any query part
+    // before matching.
     const raw = (window.location.hash || "").replace(/^#/, "");
-    if (raw === "audit") return "audit";
+    const tabName = raw.split("?", 1)[0];
+    if (tabName === "audit") return "audit";
     return "campaigns";
   }
 
@@ -137,7 +153,25 @@
     document.getElementById("audit-tab").hidden = name !== "audit";
     const nextHash = `#${name}`;
     if (window.location.hash !== nextHash) {
-      const url = `${window.location.pathname}${window.location.search}${nextHash}`;
+      // Fold any hash-embedded query (the legacy/typed form
+      // `/ui/#audit?event_type=...`) into location.search before rewriting.
+      // `readParams` tolerates both URL shapes for reads, but the history
+      // rewrite below would otherwise drop the hash-query suffix BEFORE
+      // the audit view's readFiltersFromUrl() runs via the tabchange event
+      // — silently resetting filters on first load of a hash-query URL.
+      const existingHash = window.location.hash || "";
+      const qIdx = existingHash.indexOf("?");
+      let nextSearch = window.location.search;
+      if (qIdx !== -1) {
+        const fromHash = new URLSearchParams(existingHash.slice(qIdx + 1));
+        const combined = new URLSearchParams(nextSearch.replace(/^\?/, ""));
+        for (const [k, v] of fromHash.entries()) {
+          if (!combined.has(k)) combined.set(k, v);
+        }
+        const combinedStr = combined.toString();
+        nextSearch = combinedStr ? `?${combinedStr}` : "";
+      }
+      const url = `${window.location.pathname}${nextSearch}${nextHash}`;
       history.replaceState(null, "", url);
     }
     // Signal views so they can start / stop work.
@@ -155,7 +189,15 @@
 
   window.addEventListener("hashchange", () => {
     const t = readTabFromHash();
-    if (t !== App.activeTab) setTab(t);
+    // Also run setTab when the new hash carries a query-suffix (the legacy
+    // `#audit?foo=bar` form), even if the tab didn't change — the query
+    // fold in setTab needs to run or the URL will stay malformed and the
+    // audit view's readFiltersFromUrl() will never see the filters. Without
+    // this widening, a same-tab mid-session hash push (e.g. operator pastes
+    // a share URL into an already-open tab) would silently drop its filters.
+    const newHash = window.location.hash || "";
+    const hasHashQuery = newHash.indexOf("?") !== -1;
+    if (t !== App.activeTab || hasHashQuery) setTab(t);
   });
 
   /* -------- Keyboard shortcuts (surface-wide) -------- */

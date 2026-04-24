@@ -57,19 +57,25 @@
     const form = el("form", { class: "form-grid", novalidate: "true" });
 
     // Name
+    // Re-renders after a 422 rebuild every input; `state.formValues` carries
+    // whatever the operator had typed so the form doesn't lose 50 pasted
+    // phones just because 2 were invalid.
+    const sv = state.formValues || {};
+    const nameInput = el("input", {
+      id: "f-name",
+      name: "name",
+      type: "text",
+      required: "true",
+      maxlength: "200",
+      placeholder: "e.g. NYC retention outreach",
+    });
+    if (sv.name) nameInput.value = sv.name;
     form.appendChild(
       formField({
         label: "Name",
         id: "f-name",
         wide: true,
-        control: el("input", {
-          id: "f-name",
-          name: "name",
-          type: "text",
-          required: "true",
-          maxlength: "200",
-          placeholder: "e.g. NYC retention outreach",
-        }),
+        control: nameInput,
         errorKey: "name",
       })
     );
@@ -78,9 +84,10 @@
     const tzSelect = el("select", { id: "f-timezone", name: "timezone" });
     const tzList = timezoneOptions();
     const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const tzPreferred = sv.timezone || localTz;
     for (const tz of tzList) {
       const opt = el("option", { value: tz }, tz);
-      if (tz === localTz) opt.selected = true;
+      if (tz === tzPreferred) opt.selected = true;
       tzSelect.appendChild(opt);
     }
     form.appendChild(
@@ -94,53 +101,57 @@
     );
 
     // Max concurrent
+    const maxInput = el("input", {
+      id: "f-max",
+      name: "max_concurrent",
+      type: "number",
+      min: "1",
+      max: "100",
+      placeholder: "default from settings",
+    });
+    if (sv.max) maxInput.value = sv.max;
     form.appendChild(
       formField({
         label: "Max concurrent",
         id: "f-max",
-        control: el("input", {
-          id: "f-max",
-          name: "max_concurrent",
-          type: "number",
-          min: "1",
-          max: "100",
-          placeholder: "default from settings",
-        }),
+        control: maxInput,
         errorKey: "max_concurrent",
         hint: "Optional · per-campaign cap on in-flight calls",
       })
     );
 
     // Retry config
+    const retryMaxInput = el("input", {
+      id: "f-retry-max",
+      name: "max_attempts",
+      type: "number",
+      min: "0",
+      max: "10",
+      value: sv.retryMax || "3",
+      required: "true",
+    });
     form.appendChild(
       formField({
         label: "Retry — max attempts",
         id: "f-retry-max",
-        control: el("input", {
-          id: "f-retry-max",
-          name: "max_attempts",
-          type: "number",
-          min: "0",
-          max: "10",
-          value: "3",
-          required: "true",
-        }),
+        control: retryMaxInput,
         errorKey: "retry_config.max_attempts",
       })
     );
+    const retryBaseInput = el("input", {
+      id: "f-retry-base",
+      name: "backoff_base_seconds",
+      type: "number",
+      min: "1",
+      max: "3600",
+      value: sv.retryBase || "60",
+      required: "true",
+    });
     form.appendChild(
       formField({
         label: "Retry — backoff base (seconds)",
         id: "f-retry-base",
-        control: el("input", {
-          id: "f-retry-base",
-          name: "backoff_base_seconds",
-          type: "number",
-          min: "1",
-          max: "3600",
-          value: "60",
-          required: "true",
-        }),
+        control: retryBaseInput,
         errorKey: "retry_config.backoff_base_seconds",
         hint: "Actual delay = base × 2^attempt ± 20% jitter",
       })
@@ -154,6 +165,7 @@
       placeholder: "+14155551234\n+919876543210",
       required: "true",
     });
+    if (sv.phones) phonesTa.value = sv.phones;
     form.appendChild(
       formField({
         label: "Phones",
@@ -187,11 +199,16 @@
 
     // Footer
     const footer = el("div", { class: "form-footer" });
+    // Render status from state so a success message survives the
+    // render-loop that loadList() triggers after create. Without this the
+    // "Campaign created" line was wiped ~50ms after it landed, leaving
+    // the operator with no feedback for a successful write.
     const statusLine = el("div", {
-      class: "status-line",
+      class: state.status?.kind === "ok" ? "status-line ok" : "status-line",
       id: "form-status",
       "aria-live": "polite",
     });
+    if (state.status?.text) statusLine.textContent = state.status.text;
     footer.appendChild(statusLine);
 
     const resetBtn = el("button", { type: "reset", class: "ghost" }, "Clear");
@@ -205,13 +222,24 @@
       e.preventDefault();
       submit(form);
     });
-    form.addEventListener("reset", () => {
-      setTimeout(() => {
-        state.schedule = emptySchedule();
-        state.errors = {};
-        state.status = null;
-        render();
-      }, 0);
+    // The "Clear" button is the ONLY path that should wipe state.status —
+    // a successful-submit flow that needs to preserve `state.status` for
+    // its 8-second visibility window imperatively clears inputs instead
+    // of firing `form.reset()` (which would bounce through this handler
+    // and race-clear the success line). "Clear" still takes the fast
+    // user-intent path.
+    resetBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      for (const input of form.querySelectorAll("input, textarea, select")) {
+        if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
+          input.value = "";
+        }
+      }
+      state.schedule = emptySchedule();
+      state.errors = {};
+      state.status = null;
+      state.formValues = null;
+      render();
     });
     form.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
@@ -305,6 +333,19 @@
     const phonesRaw = form.querySelector("#f-phones").value;
     const phones = phonesRaw.split("\n").map((s) => s.trim()).filter(Boolean);
 
+    // Snapshot the current field values BEFORE any render() call. On 422 we
+    // re-render to surface inline errors, which rebuilds every input; without
+    // this snapshot the operator loses typed state (e.g. 50 pasted phones
+    // disappearing when 2 were invalid).
+    state.formValues = {
+      name,
+      timezone,
+      max: maxRaw,
+      retryMax: String(maxAttempts),
+      retryBase: String(backoffBase),
+      phones: phonesRaw,
+    };
+
     // Local schedule validation — catch start >= end inline before POST.
     const schedErrIdx = [];
     for (const [k] of DAYS) {
@@ -336,23 +377,29 @@
     statusNode.classList.remove("ok");
     try {
       const created = await window.App.api.post("/campaigns", payload);
-      // Success: clear form + emit subtle status line. No toast, no modal.
-      form.reset();
+      // Success: park status in state BEFORE any DOM clear so a downstream
+      // render (e.g. loadList) finds it set. Clear inputs imperatively —
+      // form.reset() would bounce through the reset-handler and race-clear
+      // state.status ~10ms after this paints.
+      state.status = {
+        kind: "ok",
+        text: `Campaign created (${created.id}) — see audit tab`,
+      };
       state.schedule = emptySchedule();
       state.errors = {};
+      state.formValues = null;
       render();
-      // Re-find the (re-rendered) status line and mark success.
-      const newStatus = host.querySelector("#form-status");
-      if (newStatus) {
-        newStatus.textContent = `Campaign created (${created.id}) — see audit tab`;
-        newStatus.classList.add("ok");
-      }
+      setTimeout(() => {
+        if (state.status?.kind === "ok") {
+          state.status = null;
+          render();
+        }
+      }, 8000);
       await loadList();
     } catch (err) {
       mapApiError(err);
+      state.status = { kind: "err", text: "Create failed — see field errors above." };
       render();
-      const newStatus = host.querySelector("#form-status");
-      if (newStatus) newStatus.textContent = "Create failed — see field errors above.";
     }
   }
 
@@ -367,19 +414,19 @@
         const loc = Array.isArray(item.loc) ? item.loc.slice(1) : [];
         const key = loc.join(".");
         const msg = item.msg || "invalid";
-        // phones: the validator raises ValueError({invalid_phones: [...]})
-        // Pydantic surfaces it through ctx.error typically, but the safer
-        // read is the raw `msg` string which includes the structured
-        // payload. Fall back to per-field mapping.
-        if (key.startsWith("phones") && item.ctx && item.ctx.error) {
-          const ctxErr = item.ctx.error;
-          if (typeof ctxErr === "object" && Array.isArray(ctxErr.invalid_phones)) {
-            const lines = ctxErr.invalid_phones
-              .map((p) => `line ${Number(p.index) + 1}: ${p.reason}`)
-              .join("\n");
-            state.errors["phones"] = `Invalid numbers:\n${lines}`;
-            continue;
-          }
+        // phones: the validator raises PydanticCustomError with a
+        // ctx.invalid_phones list. Pydantic v2 lands that list at
+        // `item.ctx.invalid_phones` directly (no extra `.error` nesting),
+        // so the render becomes a proper "Line N: reason" list rather than
+        // Python repr of the ValueError payload.
+        const ctx = item.ctx || {};
+        const invalidPhones = Array.isArray(ctx.invalid_phones) ? ctx.invalid_phones : null;
+        if (key.startsWith("phones") && invalidPhones) {
+          const lines = invalidPhones
+            .map((p) => `Line ${Number(p.index) + 1}: ${p.reason} (got: ${p.input})`)
+            .join("\n");
+          state.errors["phones"] = lines;
+          continue;
         }
         // generic fallback
         state.errors[key] = msg;

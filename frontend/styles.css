@@ -313,7 +313,11 @@ textarea {
   top: calc(100% + 6px);
   left: 0;
   min-width: 240px;
-  max-height: 340px;
+  /* Event-type popover holds all 6 groups (Dispatch / Retry / Skips &
+   * stale / Reclaim / Lifecycle / State) in ~720px. Cap at the lesser of
+   * 760px and 80% viewport so every group is visible at 1440×900 without
+   * a silent clip, while smaller viewports still scroll gracefully. */
+  max-height: min(760px, 80vh);
   overflow: auto;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -436,6 +440,14 @@ textarea {
 
 .table .cell-reason {
   width: auto;
+  padding-right: 56px; /* reserve space for the hover-pin control */
+}
+
+.table tbody .cell-reason {
+  /* scoped to tbody so the thead th keeps its `position: sticky` (any
+   * `position: relative` declared later would override sticky on the
+   * reason header cell). */
+  position: relative;
 }
 
 .reason {
@@ -457,6 +469,44 @@ textarea {
   text-overflow: clip;
 }
 
+/* Pin / dismiss action rides inside the reason cell as an absolutely
+ * positioned overlay so the reason column can claim the full flex width
+ * instead of losing ~50% to a dedicated 6th column.
+ */
+.row-action {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  border: 0;
+  background: transparent;
+  color: var(--fg-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition:
+    opacity var(--d-80) var(--ease-out),
+    color var(--d-80) var(--ease-out),
+    background var(--d-80) var(--ease-out);
+}
+
+.row-pin-btn {
+  opacity: 0;
+}
+
+.table tbody tr:hover .row-pin-btn {
+  opacity: 1;
+}
+
+.row-action:hover {
+  color: var(--fg);
+  background: var(--bg-active);
+}
+
 .campaign-chip {
   display: inline-block;
   font-family: var(--font-mono);
@@ -471,26 +521,6 @@ textarea {
   white-space: nowrap;
 }
 
-.row-pin-btn {
-  border: 0;
-  background: transparent;
-  color: var(--fg-subtle);
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  opacity: 0;
-  transition: opacity var(--d-80) var(--ease-out),
-    color var(--d-80) var(--ease-out);
-}
-
-.table tbody tr:hover .row-pin-btn {
-  opacity: 1;
-}
-
-.row-pin-btn:hover {
-  color: var(--fg);
-  background: var(--bg-active);
-}
 
 /* ------ Event-type chips ------
  * Mapping matches the audit-view-theme SKILL.md §Event-type categorization
@@ -533,16 +563,10 @@ textarea {
 
 .chip-SKIP_CONCURRENCY,
 .chip-SKIP_BUSINESS_HOUR,
-.chip-SKIP_RETRY_BACKOFF,
 .chip-WEBHOOK_IGNORED_STALE,
 .chip-DEBUG_AGE_DIALING {
   background: rgba(217, 119, 6, 0.1);
   color: var(--warning);
-}
-
-.chip-WEBHOOK_RECEIVED {
-  background: var(--bg-hover);
-  color: var(--fg-muted);
 }
 
 /* Deliberate deviation from the semantic table: TRANSITION stays neutral so
@@ -581,32 +605,9 @@ textarea {
   display: none;
 }
 
-.pinned-row {
-  display: grid;
-  grid-template-columns: 128px 180px 140px 200px 1fr 32px;
-  gap: 12px;
-  align-items: center;
-  padding: 6px 8px;
-  border-radius: 4px;
-  font-size: 12px;
-}
-
-.pinned-row + .pinned-row {
-  border-top: 1px solid var(--border);
-}
-
-.pinned-row .dismiss {
-  border: 0;
-  background: transparent;
-  color: var(--fg-subtle);
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-
-.pinned-row .dismiss:hover {
-  background: var(--bg-hover);
-  color: var(--fg);
-}
+/* Pinned rows render inside a real <table class="pinned-table"> so they
+ * inherit the live audit table's column widths and cell classes —
+ * no dedicated `.pinned-row` grid required. */
 
 /* ------ Status badges (campaigns list) ------ */
 
@@ -764,6 +765,10 @@ textarea {
   font-size: 11px;
   color: var(--danger);
   font-family: var(--font-mono);
+  /* pre-line preserves the newline-per-line rendering of the phone validator's
+   * per-line error list (e.g. "Line 2: missing country code\nLine 3: ..."). */
+  white-space: pre-line;
+  line-height: 1.5;
 }
 
 .phones-textarea {
