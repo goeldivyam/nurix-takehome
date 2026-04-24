@@ -105,7 +105,7 @@ Full DDL lives in `schema.sql`.
 
 Calls retry on outcomes that might succeed on redial; they fail hard on outcomes that won't.
 
-- **Retryable** — `NO_ANSWER`, `BUSY`, transient provider errors. The call moves to `RETRY_PENDING` with `next_attempt_at = NOW() + base × 2^attempt ± 20% jitter`.
+- **Retryable** — `NO_ANSWER`, `BUSY`, transient provider errors. The call moves to `RETRY_PENDING` with `next_attempt_at = NOW() + base × 2^attempt ± 20% jitter`. `base` and max attempts come from the campaign's `retry_config`.
 - **Terminal** — provider rejections (invalid number, blocked) or an explicit `FAILED` from the provider. The call moves straight to `FAILED`.
 - **Exhausted** — when `retries_remaining` hits zero, the next retryable outcome becomes `FAILED`.
 
@@ -117,7 +117,6 @@ Calls retry on outcomes that might succeed on redial; they fail hard on outcomes
 - **Single process.** One event loop runs API + scheduler + webhook processor + reclaim sweep. Scale horizontally by running N replicas against the same Postgres.
 - **asyncpg.** Async non-blocking DB I/O.
 - **Three DB pools** (api / scheduler / webhook). A webhook burst or a long audit scan can't starve the scheduler tick.
-- **Mock provider in-process.** No HTTP loopback. Tests stay hermetic; a real adapter would wire to the same ingest helper.
 
 ---
 
